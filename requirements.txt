@@ -1,0 +1,27 @@
+# UAV-IRE Requirements
+# Install: pip install -r requirements.txt
+
+# Deep Learning
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Image Processing
+Pillow>=9.0.0
+opencv-python>=4.7.0
+scipy>=1.10.0
+
+# Segmentation Model
+ultralytics>=8.0.0      # YOLOv8n-seg
+
+# Data & Visualization
+matplotlib>=3.7.0
+numpy>=1.24.0
+pandas>=2.0.0
+openpyxl>=3.1.0         # Excel export
+
+# Config & Utilities
+pyyaml>=6.0
+tqdm>=4.65.0
+
+# Optional: NIQE metric
+# piq>=0.7.0
