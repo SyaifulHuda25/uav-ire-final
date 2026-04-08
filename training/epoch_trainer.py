@@ -342,9 +342,18 @@ class EpochTrainer:
 
         self.disc_loss_fn = UAVIRE_DiscriminatorLoss().to(self.device)
 
-    def _build_dataloaders(self, hr_train_dir, hr_val_dir,
-                           batch_size, gt_patch_size, scale_factor,
-                           num_workers):
+    # ── FIXED: signature sekarang menerima semua parameter yang diperlukan ──
+    def _build_dataloaders(self,
+                           dataset_root=None,
+                           train_list=None,
+                           val_list=None,
+                           hr_train_dir=None,
+                           hr_val_dir=None,
+                           batch_size=4,
+                           gt_patch_size=256,
+                           eval_patch_size=512,
+                           scale_factor=4,
+                           num_workers=2):
         # ── Pilih dataset: WeedyRice (prioritas) atau generik ──
         if self.flags['use_uav_deg']:
             from data.uav_degradation import UAVSpecificDegradationPipeline
@@ -750,6 +759,6 @@ if __name__ == '__main__':
         h.export_excel('/tmp/test_history.xlsx')
         print("Excel export: OK")
     except ImportError:
-        print("Excel export: skip (pandas/openpyxl not installed)")
+        print("Excel export: skip (pandas/openpyxl tidak terinstall)")
 
     print("EpochTrainer smoke test PASSED")
