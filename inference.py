@@ -92,7 +92,7 @@ def infer_tile(gen, lr: torch.Tensor, tile: int = 256,
             if b - top < tile:
                 top = max(0, b - tile)
             if r - left < tile:
-                left = max(0, r - left)
+                left = max(0, r - tile)
 
             tile_lr = lr[:, :, top:b, left:r]
             tile_sr = gen(tile_lr).clamp(0, 1)
