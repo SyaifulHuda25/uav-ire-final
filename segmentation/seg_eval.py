@@ -565,12 +565,11 @@ def _plot_bar_chart(summaries: Dict[str, dict], output_dir: str) -> str:
     x = np.arange(len(names))
     w = 0.26
     fig, ax = plt.subplots(figsize=(max(10, len(names) * 1.7), 6))
-    for bars, vals, lbl, col in [
-        (ax.bar(x - w, miou,  w, color='#1565C0', alpha=0.88, label='mIoU'),     miou,  'mIoU'),
-        (ax.bar(x,     iou_w, w, color='#2E7D32', alpha=0.88, label='IoU Weed'), iou_w, 'IoU Weed'),
-        (ax.bar(x + w, f1,    w, color='#E65100', alpha=0.88, label='F1'),       f1,    'F1'),
+    for bars, vals in [
+        (ax.bar(x - w, miou,  w, color='#1565C0', alpha=0.88, label='mIoU'),     miou),
+        (ax.bar(x,     iou_w, w, color='#2E7D32', alpha=0.88, label='IoU Weed'), iou_w),
+        (ax.bar(x + w, f1,    w, color='#E65100', alpha=0.88, label='F1'),       f1),
     ]:
-        _ = None  # label dan alpha sudah di ax.bar
         for bar, val in zip(bars, vals):
             ax.text(bar.get_x() + bar.get_width() / 2.0,
                     bar.get_height() + 0.005,
