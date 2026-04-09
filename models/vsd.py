@@ -50,16 +50,12 @@ class GlobalDiscriminator(nn.Module):
             return nn.Sequential(*layers)
 
         self.block1 = conv_block(in_channels, 64, stride=2, use_bn=False)
-        self.pool1 = nn.MaxPool2d(2, 2)
         self.block2 = conv_block(64, 128, stride=2, use_bn=True)
-        self.pool2 = nn.MaxPool2d(2, 2)
         self.block3 = conv_block(128, 256, stride=2, use_bn=True)
-        self.pool3 = nn.MaxPool2d(2, 2)
         self.block4 = conv_block(256, 512, stride=2, use_bn=True)
-        self.pool4 = nn.MaxPool2d(2, 2)
         self.block5 = conv_block(512, 512, stride=1, use_bn=True)
         self.block6 = conv_block(512, 512, stride=1, use_bn=True)
-        self.output = nn.Conv2d(512, 1, 4, stride=2, padding=1)
+        self.output = nn.Conv2d(512, 1, 4, stride=1, padding=1)
 
         self._init_weights()
 
@@ -74,10 +70,10 @@ class GlobalDiscriminator(nn.Module):
                 nn.init.zeros_(m.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.pool1(self.block1(x))
-        x = self.pool2(self.block2(x))
-        x = self.pool3(self.block3(x))
-        x = self.pool4(self.block4(x))
+        x = self.block1(x)
+        x = self.block2(x)
+        x = self.block3(x)
+        x = self.block4(x)
         x = self.block5(x)
         x = self.block6(x)
         return self.output(x)
