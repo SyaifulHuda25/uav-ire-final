@@ -112,12 +112,15 @@ class TrainingHistory:
         """Kembalikan dua DataFrame: epoch summary dan iteration detail."""
         import pandas as pd
 
-        # Epoch summary
+        # Epoch summary — pad semua kolom ke panjang yang sama
+        n = len(self.epochs)
         epoch_data = {'epoch': self.epochs}
         for k, v in self.train.items():
-            epoch_data[f'train_{k}'] = v
+            padded = list(v) + [None] * (n - len(v))
+            epoch_data[f'train_{k}'] = padded[:n]
         for k, v in self.val.items():
-            epoch_data[f'val_{k}'] = v
+            padded = list(v) + [None] * (n - len(v))
+            epoch_data[f'val_{k}'] = padded[:n]
         df_epoch = pd.DataFrame(epoch_data)
 
         # Iteration detail
