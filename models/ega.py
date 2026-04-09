@@ -52,11 +52,11 @@ class SobelEdgeExtractor(nn.Module):
         # Expand ke [C, 1, 3, 3] untuk depthwise conv
         self.register_buffer(
             'kx',
-            kx.unsqueeze(0).unsqueeze(0).expand(num_features, 1, 3, 3)
+            kx.unsqueeze(0).unsqueeze(0).repeat(num_features, 1, 1, 1)
         )
         self.register_buffer(
             'ky',
-            ky.unsqueeze(0).unsqueeze(0).expand(num_features, 1, 3, 3)
+            ky.unsqueeze(0).unsqueeze(0).repeat(num_features, 1, 1, 1)
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
