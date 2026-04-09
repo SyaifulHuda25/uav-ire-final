@@ -238,23 +238,16 @@ class PatchGAN_Discriminator(nn.Module):
             return nn.Sequential(*layers)
 
         # Sesuai diagram Fig.9 paper IRE
+        # FIX: hapus MaxPool agar spatial size tidak terlalu kecil sebelum block5/block6
         self.block1 = conv_block(in_channels, 64, stride=2, use_bn=False)   # K4n64s2
-        self.pool1 = nn.MaxPool2d(2, 2)
-
         self.block2 = conv_block(64, 128, stride=2, use_bn=True)            # K4n128s2+BN
-        self.pool2 = nn.MaxPool2d(2, 2)
-
         self.block3 = conv_block(128, 256, stride=2, use_bn=True)           # K4n256s2+BN
-        self.pool3 = nn.MaxPool2d(2, 2)
-
         self.block4 = conv_block(256, 512, stride=2, use_bn=True)           # K4n512s2+BN
-        self.pool4 = nn.MaxPool2d(2, 2)
-
         self.block5 = conv_block(512, 512, stride=1, use_bn=True)           # K4n512s1+BN
         self.block6 = conv_block(512, 512, stride=1, use_bn=True)           # K4n512s1+BN
 
         # Output layer: K4n1s2 - menghasilkan peta probabilitas patch
-        self.output = nn.Conv2d(512, 1, 4, stride=2, padding=1)
+        self.output = nn.Conv2d(512, 1, 4, stride=1, padding=1)
 
         self._initialize_weights()
 
@@ -269,10 +262,10 @@ class PatchGAN_Discriminator(nn.Module):
                 nn.init.zeros_(m.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.pool1(self.block1(x))
-        x = self.pool2(self.block2(x))
-        x = self.pool3(self.block3(x))
-        x = self.pool4(self.block4(x))
+        x = self.block1(x)
+        x = self.block2(x)
+        x = self.block3(x)
+        x = self.block4(x)
         x = self.block5(x)
         x = self.block6(x)
         return self.output(x)
