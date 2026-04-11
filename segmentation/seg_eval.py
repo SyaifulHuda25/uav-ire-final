@@ -119,12 +119,17 @@ def predict_weed_mask(model, img_path: str,
 def save_weed_overlay(img_path: str, pred_mask: np.ndarray,
                       gt_mask: np.ndarray, save_path: str,
                       metrics: Dict[str, float],
-                      scenario: str = '', alpha: float = 0.50) -> None:
+                      scenario: str = '', alpha: float = 0.50,
+                      display_size: int = 1024) -> None:
     """
     Simpan overlay 3-panel:
-      Panel 1: Gambar input (SR/LR/HR)
+      Panel 1: Gambar input (SR/LR/HR) — ditampilkan PENUH, di-resize ke display_size
       Panel 2: Overlay TP/FP/FN + kontur GT putih
       Panel 3: Peta segmen berwarna
+
+    [REVISI] Gambar input sekarang di-resize ke display_size (default 1024px sisi terpanjang)
+    sebelum ditampilkan, sehingga collage menampilkan gambar representatif yang besar
+    (bukan patch 256×256). Semua mask disesuaikan ke ukuran yang sama.
 
     Konvensi warna:
       Kuning = TP   Merah = FP   Hijau = FN
@@ -136,8 +141,14 @@ def save_weed_overlay(img_path: str, pred_mask: np.ndarray,
         from PIL import Image
         pil = Image.open(img_path).convert('RGB')
         img_bgr = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
-    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    H, W    = img_rgb.shape[:2]
+    img_rgb_orig = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    Ho, Wo = img_rgb_orig.shape[:2]
+
+    # [REVISI] Resize ke display_size (jaga aspek rasio) untuk visualisasi
+    scale_d = display_size / max(Ho, Wo)
+    Hd, Wd = int(Ho * scale_d), int(Wo * scale_d)
+    img_rgb = cv2.resize(img_rgb_orig, (Wd, Hd), interpolation=cv2.INTER_AREA)
+    H, W = Hd, Wd
 
     def _b(mask):
         m = cv2.resize(mask, (W, H), interpolation=cv2.INTER_NEAREST)
@@ -269,9 +280,44 @@ def make_comparison_collage(image_stems: List[str],
                 full = cv2.imread(ov_p)
                 if full is not None:
                     rgb = cv2.cvtColor(full, cv2.COLOR_BGR2RGB)
+                    # [REVISI] Ambil panel INPUT (panel kiri = gambar SR/LR/HR asli),
+                    # bukan panel tengah (overlay) yang hanya 1/3 dari gambar composite.
+                    # Panel overlay_3panel: [Input | TP/FP/FN overlay | Peta segmen]
+                    # Kita tampilkan panel 0 (input gambar penuh) agar detail maksimal.
                     _H, _W = rgb.shape[:2]
                     pw = _W // 3
-                    ax.imshow(rgb[:, pw:2 * pw, :])
+                    input_panel = rgb[:, :pw, :]          # panel kiri = gambar input
+                    overlay_panel = rgb[:, pw:2 * pw, :]  # panel tengah = overlay TP/FP/FN
+
+                    # Buat sub-figure: atas=gambar SR penuh, bawah=overlay TP/FP/FN
+                    # dengan pembagian 60/40
+                    from matplotlib.gridspec import GridSpecFromSubplotSpec
+                    inner_gs = GridSpecFromSubplotSpec(
+                        2, 1, subplot_spec=axes[col_i].get_subplotspec(),
+                        hspace=0.05, height_ratios=[3, 2])
+                    ax.remove()  # hapus axis lama
+                    ax_top = fig.add_subplot(inner_gs[0])
+                    ax_bot = fig.add_subplot(inner_gs[1])
+
+                    ax_top.imshow(input_panel)
+                    ax_top.set_title(_SC_LABELS.get(sc, sc),
+                                     fontsize=11, fontweight='bold', pad=6)
+                    ax_top.axis('off')
+                    ax_bot.imshow(overlay_panel)
+                    ax_bot.set_title('Overlay TP/FP/FN', fontsize=8, pad=2)
+                    ax_bot.axis('off')
+
+                    if 'SEG4' in sc or 'Full' in sc:
+                        for spine in ax_top.spines.values():
+                            spine.set_visible(True)
+                            spine.set_edgecolor('#1565C0')
+                            spine.set_linewidth(3)
+                        for spine in ax_bot.spines.values():
+                            spine.set_visible(True)
+                            spine.set_edgecolor('#1565C0')
+                            spine.set_linewidth(3)
+                    continue  # lewati set_title di bawah (sudah di-handle)
+
                 else:
                     ax.text(0.5, 0.5, 'N/A', ha='center', va='center',
                             transform=ax.transAxes, fontsize=12)
@@ -516,6 +562,17 @@ def run_all_scenarios(dataset_root: str, sr_results_base: str,
 
 def _make_lr_images(rgb_dir: str, lr_dir: str,
                     test_list: str, scale: int = 4):
+    """
+    [REVISI] Buat LR image untuk SEG1 dengan 2 langkah:
+      1. Downscale HR → LR (÷scale) via bicubic
+      2. Upsample LR → ukuran HR kembali via bicubic (bicubic ×scale)
+
+    Hasilnya adalah gambar PENUH berukuran sama dengan HR dan SR,
+    sehingga evaluasi segmentasi (mIoU) dilakukan secara fair pada
+    resolusi yang identik di semua skenario SEG1-SEG5.
+
+    Sebelumnya: output hanya 1/4 ukuran → gambar kecil di collage.
+    """
     os.makedirs(lr_dir, exist_ok=True)
     with open(test_list) as f:
         names = [ln.strip() for ln in f if ln.strip()]
@@ -528,8 +585,13 @@ def _make_lr_images(rgb_dir: str, lr_dir: str,
         if img is None:
             continue
         H, W = img.shape[:2]
-        cv2.imwrite(dst, cv2.resize(img, (W // scale, H // scale),
-                                    interpolation=cv2.INTER_CUBIC))
+        # Step 1: Downscale ke LR (simulasi resolusi rendah UAV)
+        lr = cv2.resize(img, (W // scale, H // scale),
+                        interpolation=cv2.INTER_CUBIC)
+        # Step 2: [REVISI] Upsample kembali ke ukuran HR (bicubic upscale)
+        # Ini adalah representasi SEG1 yang benar: LR bicubic ×4
+        lr_upscaled = cv2.resize(lr, (W, H), interpolation=cv2.INTER_CUBIC)
+        cv2.imwrite(dst, lr_upscaled)
 
 
 def _export_excel(records: List[dict], summaries: Dict[str, dict],
