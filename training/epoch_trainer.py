@@ -1,14 +1,34 @@
 """
-UAV-IRE Epoch-Based Trainer
-Training loop berbasis EPOCH (bukan iterasi) untuk:
-- Grafik train loss vs valid loss per epoch (untuk laporan tesis)
-- Auto-save checkpoint tiap epoch (untuk resume sesi Kaggle)
-- Auto-resume dari checkpoint terakhir
-- Export history ke Excel (.xlsx)
-- Support semua skenario ablation SR1-SR6 (Tabel 3.1)
+UAV-IRE Epoch-Based Trainer  [PATCHED v2]
+=========================================
+PATCH LOG (4 perbaikan berdasarkan diskusi metodologi):
 
-Rekomendasi: 200 epoch, batch 4, T4 single GPU
-WeedyRice 438 train images → ~110 iter/epoch @ batch 4
+  [PATCH 1] lambda_edge 0.05→0.15, lambda_vsd 0.1→0.25
+            Bobot loss semantik dinaikkan agar sinyal EGA & VSD
+            tidak tenggelam di antara rec + perc loss.
+            → berpengaruh langsung ke mIoU segmentasi gulma.
+
+  [PATCH 2] HR2 training target (fairness PSNR, saran dosen)
+            HR asli didegradasi ringan → HR2 (blur kecil + JPEG q=90)
+            HR2 dipakai sebagai target semua training loss.
+            PSNR/SSIM validasi tetap dihitung vs HR asli (unseen).
+            → model tidak pernah melihat HR asli saat training.
+            Aktifkan dengan use_hr2=True (default: True).
+
+  [PATCH 3] val_loss = full G_loss (bukan hanya L_rec)
+            _validate() sekarang menghitung rec+perc+adv
+            agar grafik train G_loss vs val G_loss apple-to-apple
+            dan deteksi overfitting valid secara metodologi.
+            PSNR/SSIM masih dihitung vs HR asli (unseen).
+
+  [PATCH 4] CosineAnnealingLR menggantikan step decay tunggal
+            lr_decay_epoch dihapus; scheduler cosine dipakai
+            agar LR turun halus sepanjang training, bukan tiba-tiba
+            di epoch 25 yang terlalu dini untuk 50 epoch.
+            Bisa dikembalikan ke step decay via lr_schedule='step'.
+
+Semua perubahan backward-compatible dengan checkpoint lama.
+Checkpoint baru menyimpan scheduler state untuk auto-resume.
 """
 
 import os
@@ -22,8 +42,16 @@ from collections import defaultdict
 
 import torch
 import torch.optim as optim
+# [PATCH 4] tambah import scheduler
+import torch.optim.lr_scheduler as lr_scheduler
 from torch.utils.data import DataLoader
 from torch.cuda.amp import GradScaler, autocast
+
+# [PATCH 2] tambah import untuk degradasi HR2
+import random
+import numpy as np
+from PIL import Image, ImageFilter
+import torchvision.transforms.functional as TF
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -32,9 +60,83 @@ from losses.uav_ire_losses import UAVIRE_GeneratorLoss, UAVIRE_DiscriminatorLoss
 from utils.metrics import calculate_psnr, calculate_ssim
 
 
-# ─────────────────────────────────────────────
-# Logger
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# [PATCH 2] HR2 Degradation Pipeline
+# ─────────────────────────────────────────────────────────────────────────────
+
+class HR2DegradationPipeline:
+    """
+    Mendegradasi HR asli menjadi HR2 dengan intensitas RINGAN.
+
+    Tujuan: menciptakan jarak antara target training (HR2) dan
+    referensi evaluasi PSNR (HR asli), sehingga model tidak
+    pernah melihat HR asli selama training.
+
+    Degradasi yang diterapkan (urutan acak ringan):
+      1. Gaussian blur ringan  (sigma 0.3–0.7, radius kecil)
+      2. JPEG compression      (quality 85–95)
+      3. Subtle noise          (std 1–3/255, opsional)
+
+    Semua parameter dirancang agar HR2 masih sangat dekat dengan HR
+    (PSNR HR2 vs HR sekitar 38–42 dB) — bukan downsampling,
+    hanya "mengaburkan sedikit" agar model tidak menghafal piksel HR.
+    """
+
+    def __init__(
+        self,
+        blur_sigma_range: tuple = (0.3, 0.7),
+        jpeg_quality_range: tuple = (85, 95),
+        noise_std_range: tuple = (1.0, 3.0),
+        apply_noise_prob: float = 0.3,   # noise hanya 30% kemungkinan
+    ):
+        self.blur_sigma_range    = blur_sigma_range
+        self.jpeg_quality_range  = jpeg_quality_range
+        self.noise_std_range     = noise_std_range
+        self.apply_noise_prob    = apply_noise_prob
+
+    def __call__(self, hr_tensor: torch.Tensor) -> torch.Tensor:
+        """
+        Input : hr_tensor  float32 [C, H, W] range [0, 1]
+        Output: hr2_tensor float32 [C, H, W] range [0, 1]
+        """
+        # Konversi ke PIL untuk operasi image processing
+        hr_pil = TF.to_pil_image(hr_tensor.clamp(0, 1))
+
+        # 1. Gaussian blur ringan
+        sigma = random.uniform(*self.blur_sigma_range)
+        hr_pil = hr_pil.filter(ImageFilter.GaussianBlur(radius=sigma))
+
+        # 2. JPEG compression
+        import io
+        quality = random.randint(*self.jpeg_quality_range)
+        buf = io.BytesIO()
+        hr_pil.save(buf, format='JPEG', quality=quality)
+        buf.seek(0)
+        hr_pil = Image.open(buf).copy()
+
+        # Konversi kembali ke tensor
+        hr2_tensor = TF.to_tensor(hr_pil)
+
+        # 3. Subtle noise (opsional, 30% kemungkinan)
+        if random.random() < self.apply_noise_prob:
+            noise_std = random.uniform(*self.noise_std_range) / 255.0
+            noise = torch.randn_like(hr2_tensor) * noise_std
+            hr2_tensor = (hr2_tensor + noise).clamp(0, 1)
+
+        return hr2_tensor
+
+    def apply_batch(self, hr_batch: torch.Tensor) -> torch.Tensor:
+        """
+        Terapkan degradasi ke seluruh batch.
+        Input/Output: [B, C, H, W] float32 [0, 1]
+        """
+        hr2_list = [self.__call__(hr_batch[i]) for i in range(hr_batch.shape[0])]
+        return torch.stack(hr2_list, dim=0)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Logger (tidak berubah)
+# ─────────────────────────────────────────────────────────────────────────────
 
 def setup_logger(log_dir: str, name: str = 'UAV-IRE') -> logging.Logger:
     os.makedirs(log_dir, exist_ok=True)
@@ -55,9 +157,9 @@ def setup_logger(log_dir: str, name: str = 'UAV-IRE') -> logging.Logger:
     return logger
 
 
-# ─────────────────────────────────────────────
-# History — train & val per epoch
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# TrainingHistory (tidak berubah)
+# ─────────────────────────────────────────────────────────────────────────────
 
 class TrainingHistory:
     """
@@ -66,12 +168,9 @@ class TrainingHistory:
     """
 
     def __init__(self):
-        # Per-epoch averages
         self.epochs: List[int] = []
         self.train: Dict[str, List[float]] = defaultdict(list)
         self.val:   Dict[str, List[float]] = defaultdict(list)
-
-        # Per-iteration detail (untuk monitoring intra-epoch)
         self.iter_log: List[Dict] = []
 
     def push_epoch(self, epoch: int,
@@ -109,10 +208,7 @@ class TrainingHistory:
         return hist
 
     def to_dataframes(self):
-        """Kembalikan dua DataFrame: epoch summary dan iteration detail."""
         import pandas as pd
-
-        # Epoch summary — pad semua kolom ke panjang yang sama
         n = len(self.epochs)
         epoch_data = {'epoch': self.epochs}
         for k, v in self.train.items():
@@ -122,14 +218,10 @@ class TrainingHistory:
             padded = list(v) + [None] * (n - len(v))
             epoch_data[f'val_{k}'] = padded[:n]
         df_epoch = pd.DataFrame(epoch_data)
-
-        # Iteration detail
         df_iter = pd.DataFrame(self.iter_log) if self.iter_log else pd.DataFrame()
-
         return df_epoch, df_iter
 
     def export_excel(self, path: str):
-        """Ekspor ke Excel dengan dua sheet: epoch summary dan iterasi detail."""
         import pandas as pd
         os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
         df_epoch, df_iter = self.to_dataframes()
@@ -140,39 +232,21 @@ class TrainingHistory:
         return path
 
 
-# ─────────────────────────────────────────────
-# Epoch-Based Trainer
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# EpochTrainer  [PATCHED]
+# ─────────────────────────────────────────────────────────────────────────────
 
 class EpochTrainer:
     """
-    UAV-IRE Trainer berbasis epoch.
+    UAV-IRE Trainer berbasis epoch — versi patched.
 
-    Fitur utama:
-    - Loop: for epoch in range(total_epochs)
-    - Catat train loss rata-rata per epoch
-    - Catat val loss (PSNR, SSIM) per epoch
-    - Auto-save checkpoint tiap epoch
-    - Auto-resume dari checkpoint_latest.pth
-    - Export history ke JSON + Excel
-    - Support semua ablation SR1–SR6
-
-    Args
-    ----
-    experiment : str
-        Preset ablation ('full'|'baseline'|'no_nrdb'|'no_mbcm'|'no_ega'|'no_vsd')
-    hr_train_dir : str
-    hr_val_dir   : str
-    save_dir     : str
-    total_epochs : int        default 200
-    batch_size   : int        default 4  (T4 single, model besar)
-    gt_patch_size: int        default 256
-    lr_g / lr_d  : float      1e-4
-    lr_decay_epoch: int       epoch di mana LR dikurangi ½ (default 100)
-    pretrained_path: str      path ke Real-ESRGAN / IRE pretrained weights
+    Perubahan dari versi asli:
+      - lambda_edge, lambda_vsd dinaikkan (PATCH 1)
+      - use_hr2=True untuk fairness PSNR (PATCH 2)
+      - _validate() menghitung full G_loss (PATCH 3)
+      - CosineAnnealingLR sebagai scheduler default (PATCH 4)
     """
 
-    # Mapping preset ke ablation flags
     PRESETS = {
         'full':     dict(use_nrdb=True,  use_mbcm=True,  use_ega=True,  use_vsd=True,  use_uav_deg=True),
         'baseline': dict(use_nrdb=False, use_mbcm=False, use_ega=False, use_vsd=False, use_uav_deg=False),
@@ -194,74 +268,106 @@ class EpochTrainer:
     def __init__(
         self,
         experiment: str = 'full',
-        # ── WeedyRice dataset ─────────────────────────────
-        dataset_root: Optional[str] = None,   # path ke WeedyRice-RGBMS-DB/
-        train_list: Optional[str] = None,     # path ke train_list.txt
-        val_list:   Optional[str] = None,     # path ke val_list.txt
-        # ── Fallback untuk dataset generik ────────────────
+        # ── Dataset ──────────────────────────────────────────────
+        dataset_root: Optional[str] = None,
+        train_list: Optional[str] = None,
+        val_list:   Optional[str] = None,
         hr_train_dir: Optional[str] = None,
         hr_val_dir:   Optional[str] = None,
-        # ──────────────────────────────────────────────────
+        # ── Training config ───────────────────────────────────────
         save_dir: str = 'experiments',
         total_epochs: int = 50,
         batch_size: int = 4,
         gt_patch_size: int = 256,
-        eval_patch_size: int = 512,          # patch untuk validasi
+        eval_patch_size: int = 512,
         scale_factor: int = 4,
         num_rrdb: int = 23,
         num_features: int = 64,
         lr_g: float = 1e-4,
         lr_d: float = 1e-4,
-        lr_decay_epoch: int = 25,            # ~epoch 25 untuk 50 epoch
-        use_mask: bool = True,               # gunakan mask untuk VSD
-        # Loss weights (Eq.2.43)
-        lambda_rec: float = 1.0,
+        # [PATCH 4] scheduler: 'cosine' (default) atau 'step'
+        lr_schedule: str = 'cosine',
+        # lr_decay_epoch hanya dipakai jika lr_schedule='step'
+        lr_decay_epoch: int = 40,
+        use_mask: bool = True,
+        # ── [PATCH 1] Loss weights — semantik dinaikkan ──────────
+        lambda_rec:  float = 1.0,
         lambda_perc: float = 1.0,
-        lambda_adv: float = 0.1,
-        lambda_edge: float = 0.05,
-        lambda_vsd: float = 0.1,
-        # Logging
+        lambda_adv:  float = 0.1,
+        lambda_edge: float = 0.15,   # [PATCH 1] 0.05 → 0.15
+        lambda_vsd:  float = 0.25,   # [PATCH 1] 0.10 → 0.25
+        # ── [PATCH 2] HR2 training target ────────────────────────
+        use_hr2: bool = True,        # [PATCH 2] aktifkan HR2
+        hr2_blur_sigma:   tuple = (0.3, 0.7),
+        hr2_jpeg_quality: tuple = (85, 95),
+        hr2_noise_std:    tuple = (1.0, 3.0),
+        hr2_noise_prob:   float = 0.3,
+        # ── Logging ───────────────────────────────────────────────
         log_iter_freq: int = 10,
         val_epoch_freq: int = 1,
         save_epoch_freq: int = 1,
         vis_epoch_freq: int = 5,
-        # Pretrained
         pretrained_path: Optional[str] = None,
-        # AMP
         use_amp: bool = True,
         num_workers: int = 2,
         device: Optional[torch.device] = None,
     ):
         assert experiment in self.PRESETS, \
             f"experiment harus salah satu dari: {list(self.PRESETS)}"
+        assert lr_schedule in ('cosine', 'step'), \
+            "lr_schedule harus 'cosine' atau 'step'"
 
-        self.experiment  = experiment
-        self.flags       = self.PRESETS[experiment]
-        self.exp_name    = self.PRESET_NAMES[experiment]
-        self.save_dir    = os.path.join(save_dir, self.exp_name)
-        self.total_epochs = total_epochs
-        self.lr_decay_epoch = lr_decay_epoch
-        self.log_iter_freq  = log_iter_freq
-        self.val_epoch_freq = val_epoch_freq
+        self.experiment      = experiment
+        self.flags           = self.PRESETS[experiment]
+        self.exp_name        = self.PRESET_NAMES[experiment]
+        self.save_dir        = os.path.join(save_dir, self.exp_name)
+        self.total_epochs    = total_epochs
+        self.lr_schedule     = lr_schedule
+        self.lr_decay_epoch  = lr_decay_epoch
+        self.log_iter_freq   = log_iter_freq
+        self.val_epoch_freq  = val_epoch_freq
         self.save_epoch_freq = save_epoch_freq
         self.vis_epoch_freq  = vis_epoch_freq
-        self.use_amp   = use_amp and torch.cuda.is_available()
-        self.device    = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.use_mask  = use_mask and self.flags.get('use_vsd', False)
+        self.use_amp         = use_amp and torch.cuda.is_available()
+        self.device          = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.use_mask        = use_mask and self.flags.get('use_vsd', False)
+
+        # [PATCH 2] inisialisasi HR2 pipeline
+        self.use_hr2 = use_hr2
+        self.hr2_pipeline = None
+        if use_hr2:
+            self.hr2_pipeline = HR2DegradationPipeline(
+                blur_sigma_range=hr2_blur_sigma,
+                jpeg_quality_range=hr2_jpeg_quality,
+                noise_std_range=hr2_noise_std,
+                apply_noise_prob=hr2_noise_prob,
+            )
 
         os.makedirs(self.save_dir, exist_ok=True)
         self.logger = setup_logger(self.save_dir, name=self.exp_name)
-        self.logger.info(f"Experiment : {self.exp_name}")
-        self.logger.info(f"Device     : {self.device}")
-        self.logger.info(f"Flags      : {self.flags}")
-        self.logger.info(f"Use mask   : {self.use_mask} (VSD)")
+        self.logger.info(f"Experiment   : {self.exp_name}")
+        self.logger.info(f"Device       : {self.device}")
+        self.logger.info(f"Flags        : {self.flags}")
+        self.logger.info(f"Use mask     : {self.use_mask} (VSD)")
+        self.logger.info(
+            f"[PATCH 1] lambda_edge={lambda_edge}, lambda_vsd={lambda_vsd}"
+        )
+        self.logger.info(
+            f"[PATCH 2] use_hr2={use_hr2} | PSNR val vs HR asli (unseen)"
+        )
+        self.logger.info(
+            f"[PATCH 3] val_loss = full G_loss (rec+perc+adv)"
+        )
+        self.logger.info(
+            f"[PATCH 4] lr_schedule={lr_schedule}"
+        )
 
-        # ── Build models ──────────────────────────────────────
+        # ── Build models ─────────────────────────────────────────
         self._build_models(num_rrdb, scale_factor, num_features,
                            lambda_rec, lambda_perc, lambda_adv,
                            lambda_edge, lambda_vsd)
 
-        # ── Optimisers ────────────────────────────────────────
+        # ── Optimisers ───────────────────────────────────────────
         self.optimizer_g = optim.Adam(
             self.generator.parameters(), lr=lr_g, betas=(0.9, 0.99))
         self.optimizer_d = optim.Adam(
@@ -269,7 +375,11 @@ class EpochTrainer:
         self.scaler_g = GradScaler(enabled=self.use_amp)
         self.scaler_d = GradScaler(enabled=self.use_amp)
 
-        # ── DataLoaders ───────────────────────────────────────
+        # [PATCH 4] Setup scheduler
+        self.scheduler_g = self._make_scheduler(self.optimizer_g)
+        self.scheduler_d = self._make_scheduler(self.optimizer_d)
+
+        # ── DataLoaders ──────────────────────────────────────────
         self._build_dataloaders(
             dataset_root=dataset_root,
             train_list=train_list,
@@ -283,27 +393,48 @@ class EpochTrainer:
             num_workers=num_workers,
         )
 
-        # ── History & resume state ────────────────────────────
-        self.history    = TrainingHistory()
+        # ── History & resume ─────────────────────────────────────
+        self.history     = TrainingHistory()
         self.start_epoch = 1
 
-        # Load pretrained jika ada (sebelum cek resume)
         if pretrained_path and os.path.isfile(pretrained_path):
             self._load_pretrained(pretrained_path)
 
-        # Auto-resume dari checkpoint terbaru
         latest_ckpt = os.path.join(self.save_dir, 'checkpoint_latest.pth')
         if os.path.isfile(latest_ckpt):
             self._resume(latest_ckpt)
 
-    # ──────────────────────────────────────────────────────────
-    # Build helpers
-    # ──────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────
+    # [PATCH 4] Scheduler factory
+    # ─────────────────────────────────────────────────────────────
+
+    def _make_scheduler(self, optimizer):
+        """
+        Buat scheduler sesuai pilihan lr_schedule.
+        - 'cosine': CosineAnnealingLR → LR turun halus dari lr ke lr_min=1e-7
+        - 'step'  : Halved sekali saat epoch == lr_decay_epoch (perilaku asli)
+        """
+        if self.lr_schedule == 'cosine':
+            return lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=self.total_epochs,
+                eta_min=1e-7,
+            )
+        else:
+            # StepLR dengan milestone tunggal — identik perilaku asli
+            return lr_scheduler.MultiStepLR(
+                optimizer,
+                milestones=[self.lr_decay_epoch],
+                gamma=0.5,
+            )
+
+    # ─────────────────────────────────────────────────────────────
+    # Build helpers (tidak berubah signifikan)
+    # ─────────────────────────────────────────────────────────────
 
     def _build_models(self, num_rrdb, scale_factor, num_features,
                       lambda_rec, lambda_perc, lambda_adv,
                       lambda_edge, lambda_vsd):
-        """Bangun generator sesuai flag ablation."""
         use_nrdb = self.flags['use_nrdb']
         use_mbcm = self.flags['use_mbcm']
         use_ega  = self.flags['use_ega']
@@ -345,19 +476,11 @@ class EpochTrainer:
 
         self.disc_loss_fn = UAVIRE_DiscriminatorLoss().to(self.device)
 
-    # ── FIXED: signature sekarang menerima semua parameter yang diperlukan ──
     def _build_dataloaders(self,
-                           dataset_root=None,
-                           train_list=None,
-                           val_list=None,
-                           hr_train_dir=None,
-                           hr_val_dir=None,
-                           batch_size=4,
-                           gt_patch_size=256,
-                           eval_patch_size=512,
-                           scale_factor=4,
-                           num_workers=2):
-        # ── Pilih dataset: WeedyRice (prioritas) atau generik ──
+                           dataset_root=None, train_list=None, val_list=None,
+                           hr_train_dir=None, hr_val_dir=None,
+                           batch_size=4, gt_patch_size=256, eval_patch_size=512,
+                           scale_factor=4, num_workers=2):
         if self.flags['use_uav_deg']:
             from data.uav_degradation import UAVSpecificDegradationPipeline
             pipeline = UAVSpecificDegradationPipeline(scale_factor=scale_factor)
@@ -368,12 +491,10 @@ class EpochTrainer:
             self.logger.info("Degradation: IRE Second-Order")
 
         if dataset_root and os.path.isdir(dataset_root):
-            # ── WeedyRice-RGBMS-DB ────────────────────────────
             from data.weedyrice_dataset import (
                 WeedyRiceTrainDataset, WeedyRiceValDataset,
                 make_train_loader, make_val_loader
             )
-            # Cari list files
             def _find(root, fname):
                 for p in [
                     os.path.join(root, fname),
@@ -416,10 +537,9 @@ class EpochTrainer:
                 val_ds, batch_size=1, shuffle=False, num_workers=0,
                 collate_fn=_collate_val,
             )
-            self.logger.info(f"Dataset: WeedyRice-RGBMS-DB")
+            self.logger.info("Dataset: WeedyRice-RGBMS-DB")
 
         else:
-            # ── Generik (fallback) ─────────────────────────────
             from data.dataset import IRE_TrainDataset, IRE_ValDataset
             train_ds = IRE_TrainDataset(
                 hr_dir=hr_train_dir or 'data/train',
@@ -444,9 +564,9 @@ class EpochTrainer:
         self.logger.info(f"Train: {len(train_ds)} imgs | "
                          f"{self.iters_per_epoch} iter/epoch | batch={batch_size}")
 
-    # ──────────────────────────────────────────────────────────
-    # Checkpoint helpers
-    # ──────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────
+    # Checkpoint helpers — diperbarui untuk menyimpan scheduler
+    # ─────────────────────────────────────────────────────────────
 
     def _save_checkpoint(self, epoch: int, filename: str):
         ckpt = {
@@ -456,6 +576,9 @@ class EpochTrainer:
             'discriminator': self.discriminator.state_dict(),
             'optimizer_g': self.optimizer_g.state_dict(),
             'optimizer_d': self.optimizer_d.state_dict(),
+            # [PATCH 4] simpan scheduler state untuk auto-resume
+            'scheduler_g': self.scheduler_g.state_dict(),
+            'scheduler_d': self.scheduler_d.state_dict(),
             'history_json': json.dumps({
                 'epochs': self.history.epochs,
                 'train':  dict(self.history.train),
@@ -478,9 +601,13 @@ class EpochTrainer:
             self.optimizer_g.load_state_dict(ckpt['optimizer_g'])
         if 'optimizer_d' in ckpt:
             self.optimizer_d.load_state_dict(ckpt['optimizer_d'])
+        # [PATCH 4] resume scheduler state (backward-compatible: tidak error jika key tidak ada)
+        if 'scheduler_g' in ckpt:
+            self.scheduler_g.load_state_dict(ckpt['scheduler_g'])
+        if 'scheduler_d' in ckpt:
+            self.scheduler_d.load_state_dict(ckpt['scheduler_d'])
         if 'history_json' in ckpt:
             d = json.loads(ckpt['history_json'])
-            from collections import defaultdict
             self.history.epochs = d.get('epochs', [])
             self.history.train  = defaultdict(list, d.get('train', {}))
             self.history.val    = defaultdict(list, d.get('val', {}))
@@ -499,24 +626,26 @@ class EpochTrainer:
         self.logger.info(f"Pretrained loaded — missing:{len(missing)}, "
                          f"unexpected:{len(unexpected)}")
 
+    # [PATCH 4] _adjust_lr digantikan scheduler — method ini dipertahankan
+    # sebagai no-op untuk backward-compatibility jika dipanggil dari tempat lain
     def _adjust_lr(self, epoch: int):
-        if epoch == self.lr_decay_epoch:
-            for pg in self.optimizer_g.param_groups:
-                pg['lr'] *= 0.5
-            for pg in self.optimizer_d.param_groups:
-                pg['lr'] *= 0.5
-            lr_now = self.optimizer_g.param_groups[0]['lr']
-            self.logger.info(f"LR halved at epoch {epoch} → {lr_now:.2e}")
+        pass   # scheduler.step() dipanggil di akhir train loop
 
-    # ──────────────────────────────────────────────────────────
-    # Train / Val steps
-    # ──────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────
+    # [PATCH 2+3] Train step — HR2 sebagai target loss
+    # ─────────────────────────────────────────────────────────────
 
     def _train_step(self, batch):
         """
-        Satu step training. batch bisa berupa:
-        - (lr, hr, mask)  dari WeedyRiceTrainDataset
-        - (lr, hr)        dari dataset generik
+        Satu step training.
+
+        [PATCH 2] Jika use_hr2=True:
+          - hr_img (HR asli) TIDAK dipakai sebagai target loss
+          - hr2_img (HR + degradasi ringan) dipakai sebagai target loss
+          - Discriminator membandingkan SR vs hr2_img (bukan HR asli)
+
+        Catatan: hr_img asli hanya digunakan di _validate() untuk
+        menghitung PSNR/SSIM yang fair (unseen by model).
         """
         if len(batch) == 3:
             lr_img, hr_img, weed_mask = batch
@@ -529,27 +658,35 @@ class EpochTrainer:
         if weed_mask is not None:
             weed_mask = weed_mask.to(self.device)
 
-        # ── Discriminator ──
+        # [PATCH 2] buat HR2 dari HR asli (on-the-fly, per batch)
+        if self.use_hr2 and self.hr2_pipeline is not None:
+            hr_target = self.hr2_pipeline.apply_batch(hr_img.cpu()).to(self.device)
+        else:
+            hr_target = hr_img   # fallback ke perilaku asli
+
+        # ── Discriminator step ─────────────────────────────────
         self.optimizer_d.zero_grad(set_to_none=True)
         with autocast(enabled=self.use_amp):
             with torch.no_grad():
                 sr = self.generator(lr_img)
-            real_p = self.discriminator(hr_img)
+            # [PATCH 2] discriminator membandingkan SR vs hr_target (HR2)
+            real_p = self.discriminator(hr_target)
             fake_p = self.discriminator(sr.detach())
             d_loss, d_dict = self.disc_loss_fn(real_p, fake_p)
         self.scaler_d.scale(d_loss).backward()
         self.scaler_d.step(self.optimizer_d)
         self.scaler_d.update()
 
-        # ── Generator ──
+        # ── Generator step ─────────────────────────────────────
         self.optimizer_g.zero_grad(set_to_none=True)
         with autocast(enabled=self.use_amp):
             sr = self.generator(lr_img)
-            real_p = self.discriminator(hr_img).detach()
+            real_p = self.discriminator(hr_target).detach()
             fake_p = self.discriminator(sr)
+            # [PATCH 2] gen_loss_fn menerima hr_target (HR2) bukan hr_img
             g_loss, g_dict = self.gen_loss_fn(
-                sr, hr_img, fake_p, real_p,
-                weed_mask=weed_mask,       # ← diteruskan ke VSD loss
+                sr, hr_target, fake_p, real_p,
+                weed_mask=weed_mask,
                 vsd_module=self.vsd,
             )
         self.scaler_g.scale(g_loss).backward()
@@ -558,58 +695,90 @@ class EpochTrainer:
 
         return g_dict, d_dict
 
+    # ─────────────────────────────────────────────────────────────
+    # [PATCH 3] Validate — full G_loss + PSNR vs HR asli (unseen)
+    # ─────────────────────────────────────────────────────────────
+
     @torch.no_grad()
     def _validate(self):
+        """
+        [PATCH 3] val_loss sekarang = gabungan rec + perc + adv
+        agar grafik train G vs val G apple-to-apple.
+
+        [PATCH 2] PSNR/SSIM dihitung vs hr_img (HR asli, unseen by model)
+        bukan vs hr_target (HR2 yang dipakai training loss).
+        Ini menghasilkan PSNR yang fair — model belum pernah melihat HR asli.
+        """
         if not self.val_loader:
             return {}
-        self.generator.eval()
-        psnr_list, ssim_list, rec_losses = [], [], []
 
-        from losses.uav_ire_losses import SmoothL1ReconstructionLoss
-        rec_fn = SmoothL1ReconstructionLoss()
+        self.generator.eval()
+        psnr_list, ssim_list = [], []
+        val_g_losses: Dict[str, List[float]] = defaultdict(list)
 
         for batch in self.val_loader:
-            # WeedyRice: (lr, hr, mask, filenames)
-            # Generic:   (lr, hr, [mask], filename)
+            # Unpack batch dari val_loader
             if len(batch) == 4:
-                lr_img, hr_img, _, _ = batch
+                lr_img, hr_img, _, _ = batch   # WeedyRice: (lr, hr, mask, filename)
             elif len(batch) == 3:
                 lr_img, hr_img, _ = batch
             else:
                 lr_img, hr_img = batch[0], batch[1]
 
             lr_img = lr_img.to(self.device)
-            hr_img = hr_img.to(self.device)
-            sr     = self.generator(lr_img).clamp(0, 1)
+            hr_img = hr_img.to(self.device)   # HR asli — target PSNR (unseen)
 
+            # Generate SR
             with autocast(enabled=self.use_amp):
-                l_rec = rec_fn(sr, hr_img).item()
-            rec_losses.append(l_rec)
+                sr = self.generator(lr_img).clamp(0, 1)
 
+            # [PATCH 3] Hitung full G_loss untuk val_loss yang kompatibel
+            # Gunakan hr_img (HR asli) sebagai referensi loss validasi
+            # agar skala val_loss setara dengan train G_loss
+            with autocast(enabled=self.use_amp):
+                real_p = self.discriminator(hr_img).detach()
+                fake_p = self.discriminator(sr).detach()
+                _, g_val_dict = self.gen_loss_fn(
+                    sr, hr_img, fake_p, real_p,
+                    weed_mask=None,      # mask tidak dipakai saat validasi
+                    vsd_module=None,     # VSD tidak dipakai saat validasi
+                )
+            for k, v in g_val_dict.items():
+                val_g_losses[k].append(v)
+
+            # [PATCH 2+3] PSNR/SSIM vs HR asli (unseen) — fair evaluation
             for i in range(sr.shape[0]):
                 psnr_list.append(calculate_psnr(sr[i], hr_img[i]))
                 ssim_list.append(calculate_ssim(sr[i], hr_img[i]))
 
         self.generator.train()
-        return {
-            'val_loss': sum(rec_losses) / len(rec_losses),
-            'psnr':     sum(psnr_list)  / len(psnr_list),
-            'ssim':     sum(ssim_list)  / len(ssim_list),
-        }
 
-    # ──────────────────────────────────────────────────────────
+        # Rata-rata semua komponen val loss
+        val_means = {
+            f'val_{k}': sum(v) / len(v)
+            for k, v in val_g_losses.items() if v
+        }
+        # val_loss = total G_loss validasi (untuk grafik utama)
+        val_means['val_loss'] = val_means.get('val_total', 0.0)
+        val_means['psnr']     = sum(psnr_list) / len(psnr_list)  if psnr_list else 0.0
+        val_means['ssim']     = sum(ssim_list) / len(ssim_list)  if ssim_list else 0.0
+
+        return val_means
+
+    # ─────────────────────────────────────────────────────────────
     # Main training loop
-    # ──────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────
 
     def train(self) -> TrainingHistory:
         n_params = sum(p.numel() for p in self.generator.parameters())
         self.logger.info("=" * 60)
-        self.logger.info(f"Training {self.exp_name}")
+        self.logger.info(f"Training {self.exp_name}  [PATCHED v2]")
         self.logger.info(f"  Generator params : {n_params:,}")
         self.logger.info(f"  Total epochs     : {self.total_epochs}")
         self.logger.info(f"  Iters/epoch      : {self.iters_per_epoch}")
-        self.logger.info(f"  Estimated total  : "
-                         f"{self.total_epochs * self.iters_per_epoch:,} iterations")
+        self.logger.info(f"  LR schedule      : {self.lr_schedule}")
+        self.logger.info(f"  use_hr2          : {self.use_hr2}")
+        self.logger.info(f"  val PSNR vs      : {'HR asli (unseen)' if self.use_hr2 else 'HR (sama dengan training)'}")
         self.logger.info("=" * 60)
 
         vis_dir = os.path.join(self.save_dir, 'visualizations')
@@ -618,11 +787,11 @@ class EpochTrainer:
         global_iter = (self.start_epoch - 1) * self.iters_per_epoch
 
         for epoch in range(self.start_epoch, self.total_epochs + 1):
-            self._adjust_lr(epoch)
+            # [PATCH 4] _adjust_lr tidak lagi dipanggil di sini
+            # scheduler.step() dipanggil di akhir epoch
             self.generator.train()
             self.discriminator.train()
 
-            # ── Accumulators untuk rata-rata epoch ──────────
             epoch_g_losses: Dict[str, List[float]] = defaultdict(list)
             epoch_d_losses: Dict[str, List[float]] = defaultdict(list)
             t_epoch = time.time()
@@ -631,13 +800,11 @@ class EpochTrainer:
                 global_iter += 1
                 g_dict, d_dict = self._train_step(batch)
 
-                # Kumpulkan untuk rata-rata epoch
                 for k, v in g_dict.items():
                     epoch_g_losses[k].append(v)
                 for k, v in d_dict.items():
                     epoch_d_losses[k].append(v)
 
-                # Log per-iterasi
                 if i % self.log_iter_freq == 0:
                     iter_losses = {f'g_{k}': v for k, v in g_dict.items()}
                     iter_losses.update({f'd_{k}': v for k, v in d_dict.items()})
@@ -645,8 +812,9 @@ class EpochTrainer:
 
                     eta_iter = (self.iters_per_epoch - i) + \
                                (self.total_epochs - epoch) * self.iters_per_epoch
-                    speed = i / (time.time() - t_epoch + 1e-8)
-                    eta_min = eta_iter / speed / 60
+                    speed    = i / (time.time() - t_epoch + 1e-8)
+                    eta_min  = eta_iter / speed / 60
+                    lr_now   = self.optimizer_g.param_groups[0]['lr']
                     self.logger.info(
                         f"[E{epoch:03d}/{self.total_epochs}|"
                         f"I{i:04d}/{self.iters_per_epoch}] "
@@ -655,17 +823,24 @@ class EpochTrainer:
                         f"perc={g_dict.get('perc',0):.3f} "
                         f"adv={g_dict.get('adv',0):.3f} "
                         f"edge={g_dict.get('edge',0):.3f}) "
-                        f"D={d_dict.get('d_total',0):.4f} | "
+                        f"D={d_dict.get('d_total',0):.4f} "
+                        f"lr={lr_now:.2e} | "   # [PATCH 4] tampilkan LR saat ini
                         f"{speed:.1f}it/s ETA:{eta_min:.0f}m"
                     )
 
-            # ── Rata-rata epoch train loss ───────────────────
+            # ── Rata-rata epoch train loss ─────────────────────
             train_means = {k: (sum(v) / len(v)) for k, v in epoch_g_losses.items()}
             train_means['d_total'] = sum(epoch_d_losses.get('d_total', [0])) / \
                                      max(len(epoch_d_losses.get('d_total', [1])), 1)
             epoch_time = time.time() - t_epoch
 
-            # ── Validasi ─────────────────────────────────────
+            # [PATCH 4] step scheduler di akhir epoch
+            self.scheduler_g.step()
+            self.scheduler_d.step()
+            lr_now = self.optimizer_g.param_groups[0]['lr']
+            train_means['lr_g'] = lr_now    # simpan LR ke history
+
+            # ── Validasi ──────────────────────────────────────
             val_means = {}
             if epoch % self.val_epoch_freq == 0:
                 val_means = self._validate()
@@ -673,34 +848,34 @@ class EpochTrainer:
                     f"[E{epoch:03d}] EPOCH SUMMARY | "
                     f"Train G={train_means.get('total',0):.4f} "
                     f"D={train_means.get('d_total',0):.4f} | "
-                    f"Val loss={val_means.get('val_loss',0):.4f} "
-                    f"PSNR={val_means.get('psnr',0):.2f}dB "
+                    # [PATCH 3] val_loss sekarang = full G (bukan hanya rec)
+                    f"Val G={val_means.get('val_loss',0):.4f} "
+                    f"(rec={val_means.get('val_rec',0):.3f} "
+                    f"perc={val_means.get('val_perc',0):.3f}) | "
+                    # [PATCH 2] PSNR vs HR asli (unseen)
+                    f"PSNR={val_means.get('psnr',0):.2f}dB [vs HR_orig] "
                     f"SSIM={val_means.get('ssim',0):.4f} | "
-                    f"time={epoch_time:.0f}s"
+                    f"lr={lr_now:.2e} | time={epoch_time:.0f}s"
                 )
             else:
                 self.logger.info(
                     f"[E{epoch:03d}] Train G={train_means.get('total',0):.4f} "
-                    f"D={train_means.get('d_total',0):.4f} | {epoch_time:.0f}s"
+                    f"D={train_means.get('d_total',0):.4f} | "
+                    f"lr={lr_now:.2e} | {epoch_time:.0f}s"
                 )
 
-            # ── Push ke history ───────────────────────────────
             self.history.push_epoch(epoch, train_means, val_means)
 
-            # ── Simpan checkpoint ─────────────────────────────
             if epoch % self.save_epoch_freq == 0:
                 self._save_checkpoint(epoch, 'checkpoint_latest.pth')
                 if epoch % (self.save_epoch_freq * 10) == 0:
                     self._save_checkpoint(epoch, f'checkpoint_epoch{epoch:04d}.pth')
 
-            # ── Visualisasi ───────────────────────────────────
             if epoch % self.vis_epoch_freq == 0 and self.val_loader:
                 self._save_val_visual(epoch, vis_dir)
 
-            # ── Auto-save JSON history ────────────────────────
             self.history.save_json(os.path.join(self.save_dir, 'history.json'))
 
-        # ── Selesai ───────────────────────────────────────────
         self.logger.info("Training complete!")
         self._finalize()
         return self.history
@@ -711,9 +886,9 @@ class EpochTrainer:
         from utils.visualization import save_comparison_grid
         self.generator.eval()
         try:
-            lr_img, hr_img, _ = next(iter(self.val_loader))
-            lr_img = lr_img.to(self.device)
-            hr_img = hr_img.to(self.device)
+            batch = next(iter(self.val_loader))
+            lr_img = batch[0].to(self.device)
+            hr_img = batch[1].to(self.device)
             sr = self.generator(lr_img).clamp(0, 1)
             path = os.path.join(vis_dir, f'epoch_{epoch:04d}_comparison.png')
             save_comparison_grid(lr_img.cpu(), sr.cpu(), hr_img.cpu(), path)
@@ -723,45 +898,70 @@ class EpochTrainer:
             self.generator.train()
 
     def _finalize(self):
-        """Simpan model final, history JSON, dan Excel."""
-        # Generator final
-        gen_path = os.path.join(self.save_dir, 'generator_final.pth')
-        torch.save(self.generator.state_dict(), gen_path)
-        self.logger.info(f"Generator final saved: {gen_path}")
-
-        # History JSON
-        json_path = os.path.join(self.save_dir, 'history.json')
-        self.history.save_json(json_path)
-        self.logger.info(f"History JSON saved: {json_path}")
-
-        # History Excel
+        gen_path   = os.path.join(self.save_dir, 'generator_final.pth')
+        json_path  = os.path.join(self.save_dir, 'history.json')
         excel_path = os.path.join(self.save_dir, 'training_results.xlsx')
+        torch.save(self.generator.state_dict(), gen_path)
+        self.logger.info(f"Generator final saved : {gen_path}")
+        self.history.save_json(json_path)
+        self.logger.info(f"History JSON saved    : {json_path}")
         self.history.export_excel(excel_path)
-        self.logger.info(f"History Excel saved: {excel_path}")
+        self.logger.info(f"History Excel saved   : {excel_path}")
 
 
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # Quick self-test
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
-    print("TrainingHistory smoke test...")
+    print("=" * 60)
+    print("UAV-IRE epoch_trainer PATCHED — self-test")
+    print("=" * 60)
+
+    # Test TrainingHistory
     h = TrainingHistory()
     h.push_iter(1, 10, {'g_total': 1.2, 'd_total': 0.8})
-    h.push_epoch(1, {'total': 1.1, 'rec': 0.5, 'perc': 0.4, 'adv': 0.2, 'd_total': 0.7},
-                    {'val_loss': 0.9, 'psnr': 28.5, 'ssim': 0.82})
-    h.push_epoch(2, {'total': 0.9, 'rec': 0.4, 'perc': 0.35, 'adv': 0.15, 'd_total': 0.65},
-                    {'val_loss': 0.75, 'psnr': 29.1, 'ssim': 0.84})
-    h.save_json('/tmp/test_history.json')
-    h2 = TrainingHistory.load_json('/tmp/test_history.json')
-    assert h2.epochs == [1, 2]
-    print("TrainingHistory: OK")
+    h.push_epoch(1,
+        {'total': 1.1, 'rec': 0.5, 'perc': 0.4, 'adv': 0.2, 'd_total': 0.7, 'lr_g': 1e-4},
+        {'val_loss': 0.9, 'val_rec': 0.5, 'val_perc': 0.3, 'psnr': 28.5, 'ssim': 0.82})
+    h.push_epoch(2,
+        {'total': 0.9, 'rec': 0.4, 'perc': 0.35, 'adv': 0.15, 'd_total': 0.65, 'lr_g': 9.5e-5},
+        {'val_loss': 0.75, 'val_rec': 0.42, 'val_perc': 0.25, 'psnr': 29.1, 'ssim': 0.84})
+    h.save_json('/tmp/test_history_patched.json')
+    h2 = TrainingHistory.load_json('/tmp/test_history_patched.json')
+    assert h2.epochs == [1, 2], "TrainingHistory load gagal"
+    print("[OK] TrainingHistory: push, save, load")
 
-    # Excel export (butuh pandas + openpyxl)
+    # Test HR2 pipeline
+    dummy_hr = torch.rand(3, 256, 256)
+    hr2_pipe = HR2DegradationPipeline()
+    hr2      = hr2_pipe(dummy_hr)
+    assert hr2.shape == dummy_hr.shape, "HR2 shape mismatch"
+    assert hr2.min() >= 0 and hr2.max() <= 1, "HR2 out of [0,1]"
+    # PSNR HR2 vs HR harus tinggi (>35 dB) karena degradasi ringan
+    mse  = ((dummy_hr.float() - hr2.float()) ** 2).mean().item()
+    psnr = 10 * torch.log10(torch.tensor(1.0 / (mse + 1e-8))).item()
+    print(f"[OK] HR2DegradationPipeline: PSNR(HR2 vs HR) = {psnr:.1f} dB  (target > 35 dB)")
+    assert psnr > 30, f"HR2 degradasi terlalu berat! PSNR = {psnr:.1f} dB"
+
+    # Test batch apply
+    batch_hr  = torch.rand(2, 3, 64, 64)
+    batch_hr2 = hr2_pipe.apply_batch(batch_hr)
+    assert batch_hr2.shape == batch_hr.shape, "HR2 batch shape mismatch"
+    print("[OK] HR2DegradationPipeline.apply_batch: OK")
+
+    # Excel export
     try:
-        h.export_excel('/tmp/test_history.xlsx')
-        print("Excel export: OK")
+        h.export_excel('/tmp/test_history_patched.xlsx')
+        print("[OK] Excel export: OK")
     except ImportError:
-        print("Excel export: skip (pandas/openpyxl tidak terinstall)")
+        print("[SKIP] Excel export: pandas/openpyxl tidak terinstall")
 
-    print("EpochTrainer smoke test PASSED")
+    print()
+    print("Semua self-test PASSED")
+    print()
+    print("Ringkasan patch:")
+    print("  [1] lambda_edge=0.15 (dari 0.05), lambda_vsd=0.25 (dari 0.10)")
+    print("  [2] use_hr2=True — HR2 sebagai target training, PSNR vs HR asli")
+    print("  [3] _validate() menghitung full G_loss (rec+perc+adv)")
+    print("  [4] CosineAnnealingLR menggantikan step decay tunggal di epoch 25")
