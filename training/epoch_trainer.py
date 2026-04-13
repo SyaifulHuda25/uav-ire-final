@@ -19,6 +19,12 @@ PATCH LOG:
             Hitung PSNR + SSIM + NIQE vs HR asli, tiap 10 epoch saja.
             Dipisah dari _validate() agar tidak memperlambat tiap epoch.
 
+  [FIX-VAL] WeedyRiceValDataset sekarang pakai degradation pipeline
+            yang sama dengan training (bukan bicubic).
+            use_hr2 default diubah ke False agar target training = HR asli.
+            Kedua fix ini menghilangkan domain gap penyebab PSNR ~15 dB.
+            HR2 tetap tersedia — aktifkan dengan use_hr2=True jika diinginkan.
+
 Perubahan dari PATCHED v2:
   - _validate() disederhanakan: HANYA val_loss (L_rec), setiap epoch
   - _validate() tidak lagi hitung PSNR, SSIM, full G_loss
@@ -252,7 +258,7 @@ class EpochTrainer:
         lambda_adv:  float = 0.1,
         lambda_edge: float = 0.15,         # [PATCH 1]
         lambda_vsd:  float = 0.25,         # [PATCH 1]
-        use_hr2: bool = True,              # [PATCH 2]
+        use_hr2: bool = False,             # [PATCH 2] default OFF — aktifkan jika ingin target HR2 (saran dosen)
         hr2_blur_sigma:   tuple = (0.3, 0.7),
         hr2_jpeg_quality: tuple = (85, 95),
         hr2_noise_std:    tuple = (1.0, 3.0),
@@ -430,7 +436,8 @@ class EpochTrainer:
             val_ds = WeedyRiceValDataset(
                 dataset_root=dataset_root, list_file=_val_list,
                 eval_patch_size=eval_patch_size, scale_factor=scale_factor,
-                use_mask=self.use_mask)
+                use_mask=self.use_mask,
+                degradation_pipeline=pipeline)  # [FIX] konsisten dengan training
             self.val_loader = DataLoader(
                 val_ds, batch_size=1, shuffle=False, num_workers=0,
                 collate_fn=_collate_val)
