@@ -1,442 +1,220 @@
 """
-UAV-Specific Degradation Model
-Sesuai proposal tesis Section 2.11.5 dan Eq.(2.30)-(2.36)
+UAV-IRE UAV-Specific Degradation Pipeline
+==========================================
+Sesuai proposal Eq.(2.31)–(2.36):
+  motion blur → exposure flicker → downsample → noise → rotasi → JPEG
 
-Memperluas pipeline degradasi IRE (second-order) dengan degradasi khas UAV:
-1. Motion Blur Non-uniform (Eq.2.31): rotasi mikro UAV, getaran gimbal
-2. Exposure Flicker (Eq.2.32): perubahan intensitas pencahayaan alami
-3. Downsampling + UAV Noise (Eq.2.33)(Eq.2.34)
-4. Rotasi Kamera Kecil (Eq.2.35): perubahan sudut gimbal
-5. Kompresi JPEG (Eq.2.36): artefak penyimpanan/transmisi
+Tersedia 4 level intensitas degradasi:
+  'mild'     : degradasi ringan  — untuk eksperimen awal / pre-train
+  'moderate' : degradasi sedang  — mendekati kondisi UAV nyata (REKOMENDASI)
+  'strong'   : degradasi kuat    — kondisi UAV dengan gangguan signifikan
+  'severe'   : degradasi ekstrem — stress test (tidak direkomendasikan untuk tesis)
 
-Pipeline lengkap (Eq.2.30):
-    ILR = C_JPEG(Rθ(((IHR ⊗ k_motion) · α) ↓s + n_UAV))
+Cara pakai di notebook SEL 1:
+  DEGRADATION_LEVEL = 'mild'      # ganti sesuai skenario
 
-Degradasi tambahan yang tidak ada di Real-ESRGAN/IRE:
-- Haze ringan: kelembaban dan partikel udara area sawah
-- Exposure flicker: perubahan pencahayaan akibat awan, matahari, refleksi air
-- Rotasi kamera kecil akibat perubahan sudut gimbal
+Cara pakai di epoch_trainer.py:
+  pipeline = UAVSpecificDegradationPipeline(scale_factor=4, level='mild')
 """
 
 import random
-import math
-import numpy as np
+import io
 import torch
 import torch.nn.functional as F
 import torchvision.transforms.functional as TF
-from PIL import Image
-import io
-from typing import Tuple, Optional
-
-import sys
-import os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from data.degradation import (
-    IRE_DegradationPipeline,
-    add_jpeg_compression,
-    clip_image,
-    RESIZE_MODES,
-    random_choice,
-    downsample_to_size,
-)
+from PIL import Image, ImageFilter
 
 
-# ---------------------------------------------------------------------------
-# 1. UAV Motion Blur Non-uniform
-# Sesuai Eq.(2.31): I_blur = IHR ⊗ k_motion
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────
+# Parameter preset per level
+# ─────────────────────────────────────────────────────────────────
 
-def generate_motion_kernel(
-    kernel_size: int,
-    angle: float,
-    length: int,
-) -> torch.Tensor:
-    """
-    Generate motion blur kernel linear (sesuai degradasi UAV).
-    Kernel non-isotropik dengan arah dan panjang acak.
+LEVEL_PARAMS = {
+    'mild': dict(
+        # Motion blur (Eq.2.31): simulasi getaran gimbal ringan
+        blur_sigma_range   = (0.3, 0.8),
+        # Exposure flicker (Eq.2.32): variasi pencahayaan kecil
+        exposure_range     = (0.95, 1.05),
+        # Noise (Eq.2.34): noise sensor rendah
+        gaussian_std_range = (0.005, 0.010),
+        poisson_scale      = 0.10,           # bobot noise Poisson
+        # Rotasi kamera (Eq.2.35): perubahan sudut gimbal sangat kecil
+        rotation_range     = (-0.5, 0.5),
+        # JPEG compression (Eq.2.36): kualitas tinggi
+        jpeg_quality_range = (85, 95),
+    ),
+    'moderate': dict(
+        blur_sigma_range   = (0.8, 1.5),
+        exposure_range     = (0.90, 1.10),
+        gaussian_std_range = (0.010, 0.020),
+        poisson_scale      = 0.20,
+        rotation_range     = (-1.0, 1.0),
+        jpeg_quality_range = (75, 85),
+    ),
+    'strong': dict(
+        blur_sigma_range   = (1.5, 2.5),
+        exposure_range     = (0.85, 1.15),
+        gaussian_std_range = (0.020, 0.040),
+        poisson_scale      = 0.30,
+        rotation_range     = (-2.0, 2.0),
+        jpeg_quality_range = (65, 80),
+    ),
+    'severe': dict(
+        blur_sigma_range   = (2.5, 4.0),
+        exposure_range     = (0.80, 1.20),
+        gaussian_std_range = (0.030, 0.060),
+        poisson_scale      = 0.40,
+        rotation_range     = (-3.0, 3.0),
+        jpeg_quality_range = (50, 70),
+    ),
+}
 
-    Sesuai Eq.(2.31): k_motion = kernel non-isotropik acak
-    """
-    kernel = torch.zeros(kernel_size, kernel_size)
-    center = kernel_size // 2
-
-    # Gambar garis blur dengan panjang dan sudut tertentu
-    cos_a = math.cos(angle)
-    sin_a = math.sin(angle)
-
-    half_len = min(length // 2, center)
-    for i in range(-half_len, half_len + 1):
-        x = int(center + round(i * cos_a))
-        y = int(center + round(i * sin_a))
-        if 0 <= x < kernel_size and 0 <= y < kernel_size:
-            kernel[y, x] = 1.0
-
-    # Fallback jika kernel kosong
-    if kernel.sum() == 0:
-        kernel[center, center] = 1.0
-
-    kernel = kernel / kernel.sum()
-    return kernel
-
-
-def apply_uav_motion_blur(
-    img: torch.Tensor,
-    kernel_size_range: Tuple[int, int] = (7, 17),
-    angle_range: Tuple[float, float] = (0, math.pi),
-    length_range: Tuple[int, int] = (3, 8),
-) -> torch.Tensor:
-    """
-    Terapkan UAV motion blur non-uniform.
-    Sesuai Eq.(2.31): I_blur = IHR ⊗ k_motion
-
-    Motion blur UAV bersifat non-uniform karena:
-    - Rotasi mikro wahana (berbeda di tiap frame)
-    - Getaran gimbal (arah dan amplitudo bervariasi)
-    """
-    # Pilih kernel size (ganjil)
-    k_min, k_max = kernel_size_range
-    kernel_size = random.choice(range(
-        k_min if k_min % 2 == 1 else k_min + 1,
-        k_max + 1, 2
-    ))
-    angle = random.uniform(*angle_range)
-    length = random.randint(*length_range)
-
-    kernel = generate_motion_kernel(kernel_size, angle, length)
-
-    squeeze = img.dim() == 3
-    if squeeze:
-        img = img.unsqueeze(0)
-
-    kernel = kernel.to(img.device)
-    C = img.shape[1]
-    padding = kernel_size // 2
-    kernel_4d = kernel.unsqueeze(0).unsqueeze(0).expand(C, 1, -1, -1)
-    out = F.conv2d(img, kernel_4d, padding=padding, groups=C)
-
-    if squeeze:
-        out = out.squeeze(0)
-    return clip_image(out)
-
-
-# ---------------------------------------------------------------------------
-# 2. Exposure Flicker
-# Sesuai Eq.(2.32): I_exp = α · I_blur
-# ---------------------------------------------------------------------------
-
-def apply_exposure_flicker(
-    img: torch.Tensor,
-    alpha_range: Tuple[float, float] = (0.7, 1.3),
-) -> torch.Tensor:
-    """
-    Simulasi exposure flicker akibat perubahan pencahayaan.
-    Sesuai Eq.(2.32): I_exp = α · I_blur
-    α ~ U(α_min, α_max)
-
-    Penyebab pada UAV:
-    - Pergerakan awan (bayangan tiba-tiba)
-    - Perubahan sudut matahari
-    - Refleksi cahaya dari permukaan air sawah
-    """
-    alpha = random.uniform(*alpha_range)  # α ~ U(α_min, α_max)
-    return clip_image(img * alpha)
-
-
-# ---------------------------------------------------------------------------
-# 3. UAV Noise (Gaussian + Poisson)
-# Sesuai Eq.(2.33)(2.34): n_UAV = n_Gauss + n_Poisson
-# ---------------------------------------------------------------------------
-
-def add_uav_noise(
-    img: torch.Tensor,
-    gaussian_sigma_range: Tuple[float, float] = (1, 20),
-    poisson_scale_range: Tuple[float, float] = (0.05, 2.0),
-    gray_noise_prob: float = 0.4,
-) -> torch.Tensor:
-    """
-    Tambahkan noise UAV: campuran Gaussian + Poisson.
-    Sesuai Eq.(2.34): n_UAV = n_Gauss + n_Poisson
-
-    Sumber noise pada UAV:
-    - n_Gauss: noise sensor kamera, noise elektronik
-    - n_Poisson: noise akibat jumlah foton yang terbatas (shot noise)
-    """
-    # n_Gaussian
-    sigma_g = random.uniform(*gaussian_sigma_range) / 255.0
-    if random.random() < gray_noise_prob:
-        n_gauss = torch.randn_like(img[:1]) * sigma_g
-        n_gauss = n_gauss.expand_as(img)
-    else:
-        n_gauss = torch.randn_like(img) * sigma_g
-
-    # n_Poisson (shot noise)
-    scale_p = random.uniform(*poisson_scale_range)
-    n_poisson = (torch.poisson(img.clamp(0) * 255) / 255.0 - img.clamp(0)) * scale_p
-
-    return clip_image(img + n_gauss + n_poisson)
-
-
-# ---------------------------------------------------------------------------
-# 4. Rotasi Kamera Kecil
-# Sesuai Eq.(2.35): I_rot = R_θ(I_ds)
-# θ ~ U(-θ_max, θ_max)
-# ---------------------------------------------------------------------------
-
-def apply_small_rotation(
-    img: torch.Tensor,
-    theta_max: float = 5.0,  # derajat, sesuai "rotasi kecil" pada UAV
-) -> torch.Tensor:
-    """
-    Terapkan rotasi kamera kecil.
-    Sesuai Eq.(2.35): I_rot = R_θ(I_ds)
-    θ ~ U(-θ_max, θ_max)
-
-    Penyebab: perubahan sudut gimbal selama penerbangan.
-    """
-    theta = random.uniform(-theta_max, theta_max)  # dalam derajat
-
-    squeeze = img.dim() == 3
-    if squeeze:
-        img = img.unsqueeze(0)
-
-    # Konversi ke PIL untuk rotasi, lalu kembali
-    B = img.shape[0]
-    rotated = []
-    for i in range(B):
-        img_np = (img[i].permute(1, 2, 0).cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
-        pil_img = Image.fromarray(img_np)
-        pil_rot = pil_img.rotate(theta, resample=Image.BILINEAR, expand=False)
-        t = torch.from_numpy(np.array(pil_rot)).permute(2, 0, 1).float() / 255.0
-        rotated.append(t.to(img.device))
-
-    out = torch.stack(rotated)
-    if squeeze:
-        out = out.squeeze(0)
-    return clip_image(out)
-
-
-# ---------------------------------------------------------------------------
-# 5. Haze Ringan
-# Simulasi kelembaban dan partikel udara area persawahan
-# ---------------------------------------------------------------------------
-
-def apply_haze(
-    img: torch.Tensor,
-    haze_intensity_range: Tuple[float, float] = (0.05, 0.2),
-    atmospheric_light_range: Tuple[float, float] = (0.8, 1.0),
-) -> torch.Tensor:
-    """
-    Simulasi haze ringan (efek kabut ringan dari kelembaban sawah).
-    Model: I_haze = img * t + A * (1 - t)
-    di mana t = transmission map, A = atmospheric light.
-
-    Sesuai deskripsi di proposal Section 2.4 (Gambar 2.5).
-    """
-    beta = random.uniform(*haze_intensity_range)  # Koefisien scattering
-    A = random.uniform(*atmospheric_light_range)   # Atmospheric light
-
-    # Transmission map yang uniform (haze ringan)
-    t = math.exp(-beta)  # Penyederhanaan: depth uniform
-
-    # Model haze: I = img * t + A * (1 - t)
-    hazy = img * t + A * (1 - t)
-    return clip_image(hazy)
-
-
-# ---------------------------------------------------------------------------
-# UAV-Specific Degradation Pipeline
-# Sesuai Eq.(2.30) proposal
-# ---------------------------------------------------------------------------
 
 class UAVSpecificDegradationPipeline:
     """
-    UAV-Specific Degradation Model.
-
-    Sesuai proposal Section 2.11.5 dan Eq.(2.30):
-    ILR = C_JPEG(Rθ(((IHR ⊗ k_motion) · α) ↓s + n_UAV))
-
-    Memperluas IRE degradation pipeline dengan:
-    1. Motion blur non-uniform (sesuai karakteristik UAV)
-    2. Exposure flicker
-    3. Noise UAV (Gaussian + Poisson)
-    4. Downsampling
-    5. Rotasi kamera kecil
-    6. JPEG compression
-
-    Tambahan opsional:
-    - Haze ringan (lingkungan sawah)
-    - Sinc filter (ringing artifacts)
+    Pipeline degradasi khas citra UAV persawahan.
+    Mengikuti urutan Eq.(2.31)–(2.36) dari proposal.
 
     Args:
-        scale_factor: Faktor downsampling
-        prob_motion_blur: Probabilitas motion blur diterapkan
-        prob_exposure: Probabilitas exposure flicker
-        prob_haze: Probabilitas haze ringan
-        prob_rotation: Probabilitas rotasi kamera kecil
-        use_second_order_base: Juga terapkan IRE second-order pipeline
+        scale_factor: Faktor downsampling (default 4 untuk SR×4)
+        level: Level intensitas degradasi ('mild'|'moderate'|'strong'|'severe')
+
+    Input : torch.Tensor [C, H, W] float32 range [0,1]  (HR asli)
+    Output: torch.Tensor [C, H//scale, W//scale] float32 range [0,1]  (LR terdegradasi)
     """
 
-    def __init__(
-        self,
-        scale_factor: int = 4,
-        # Motion blur
-        prob_motion_blur: float = 0.8,
-        motion_kernel_range: Tuple[int, int] = (7, 15),
-        motion_angle_range: Tuple[float, float] = (0, math.pi),
-        motion_length_range: Tuple[int, int] = (2, 6),
-        # Exposure
-        prob_exposure: float = 0.7,
-        alpha_range: Tuple[float, float] = (0.75, 1.25),
-        # Noise
-        gaussian_sigma_range: Tuple[float, float] = (1, 20),
-        poisson_scale_range: Tuple[float, float] = (0.05, 2.0),
-        gray_noise_prob: float = 0.4,
-        # Haze
-        prob_haze: float = 0.3,
-        haze_intensity_range: Tuple[float, float] = (0.05, 0.15),
-        # Rotation
-        prob_rotation: float = 0.5,
-        theta_max: float = 3.0,
-        # JPEG
-        jpeg_quality_range: Tuple[int, int] = (40, 90),
-        # General
-        resize_prob: Tuple[float, float, float] = (0.2, 0.7, 0.1),
-    ):
+    LEVELS = ('mild', 'moderate', 'strong', 'severe')
+
+    def __init__(self, scale_factor: int = 4, level: str = 'moderate'):
+        assert level in self.LEVELS, \
+            f"level harus salah satu dari {self.LEVELS}, bukan '{level}'"
         self.scale_factor = scale_factor
+        self.level        = level
+        self.params       = LEVEL_PARAMS[level]
 
-        self.prob_motion_blur = prob_motion_blur
-        self.motion_kernel_range = motion_kernel_range
-        self.motion_angle_range = motion_angle_range
-        self.motion_length_range = motion_length_range
-
-        self.prob_exposure = prob_exposure
-        self.alpha_range = alpha_range
-
-        self.gaussian_sigma_range = gaussian_sigma_range
-        self.poisson_scale_range = poisson_scale_range
-        self.gray_noise_prob = gray_noise_prob
-
-        self.prob_haze = prob_haze
-        self.haze_intensity_range = haze_intensity_range
-
-        self.prob_rotation = prob_rotation
-        self.theta_max = theta_max
-
-        self.jpeg_quality_range = jpeg_quality_range
-        self.resize_prob = resize_prob
-
-    def __call__(self, hr_patch: torch.Tensor) -> torch.Tensor:
-        """
-        Terapkan UAV-specific degradation pipeline.
-
-        Sesuai Eq.(2.30):
-        ILR = C_JPEG(Rθ(((IHR ⊗ k_motion) · α) ↓s + n_UAV))
-
-        Args:
-            hr_patch: Tensor [C, H, W] float [0, 1]
-
-        Returns:
-            lr_patch: Tensor dengan ukuran H//scale × W//scale
-        """
-        img = hr_patch.clone()
-        H, W = img.shape[-2], img.shape[-1]
-        target_h, target_w = H // self.scale_factor, W // self.scale_factor
-
-        # ---- Step 1: Motion Blur (Eq.2.31: I_blur = IHR ⊗ k_motion) ----
-        if random.random() < self.prob_motion_blur:
-            img = apply_uav_motion_blur(
-                img,
-                kernel_size_range=self.motion_kernel_range,
-                angle_range=self.motion_angle_range,
-                length_range=self.motion_length_range,
-            )
-
-        # ---- Step 2: Exposure Flicker (Eq.2.32: I_exp = α · I_blur) ----
-        if random.random() < self.prob_exposure:
-            img = apply_exposure_flicker(img, alpha_range=self.alpha_range)
-
-        # ---- Step 3: Haze ringan (opsional, sesuai Section 2.4) ----
-        if random.random() < self.prob_haze:
-            img = apply_haze(img, haze_intensity_range=self.haze_intensity_range)
-
-        # ---- Step 4: Downsampling (Eq.2.33: I_ds = I_exp ↓s) ----
-        p = random.random()
-        cumsum = [self.resize_prob[0],
-                  self.resize_prob[0] + self.resize_prob[1], 1.0]
-        if p < cumsum[0]:
-            # Up kemudian down
-            up_factor = random.uniform(1.0, 2.0)
-            mode = random_choice(RESIZE_MODES)
-            img_up = F.interpolate(
-                img.unsqueeze(0) if img.dim() == 3 else img,
-                scale_factor=up_factor, mode=mode,
-                align_corners=False if mode in ['bilinear', 'bicubic'] else None,
-                antialias=(mode in ['bicubic', 'bilinear'])
-            )
-            img_up = img_up.squeeze(0) if img.dim() == 3 else img_up
-            img = downsample_to_size(img_up if img.dim() == 3 else img_up, target_h, target_w)
-        else:
-            img = downsample_to_size(img, target_h, target_w)
-
-        # ---- Step 5: UAV Noise (Eq.2.33-2.34: I_ds + n_UAV) ----
-        img = add_uav_noise(
-            img,
-            gaussian_sigma_range=self.gaussian_sigma_range,
-            poisson_scale_range=self.poisson_scale_range,
-            gray_noise_prob=self.gray_noise_prob,
+    def __repr__(self):
+        p = self.params
+        return (
+            f"UAVSpecificDegradationPipeline("
+            f"level='{self.level}', scale={self.scale_factor}x, "
+            f"blur={p['blur_sigma_range']}, "
+            f"noise_std={p['gaussian_std_range']}, "
+            f"jpeg={p['jpeg_quality_range']})"
         )
 
-        # ---- Step 6: Rotasi Kamera Kecil (Eq.2.35: I_rot = Rθ(I_ds)) ----
-        if random.random() < self.prob_rotation:
-            img = apply_small_rotation(img, theta_max=self.theta_max)
+    def __call__(self, hr_tensor: torch.Tensor) -> torch.Tensor:
+        """
+        Terapkan pipeline degradasi ke satu gambar HR.
 
-        # ---- Step 7: JPEG Compression (Eq.2.36: ILR = C_JPEG(I_rot)) ----
-        img = add_jpeg_compression(img, quality_range=self.jpeg_quality_range)
+        Args:
+            hr_tensor: [C, H, W] float32 [0,1]
+        Returns:
+            lr_tensor: [C, H//scale, W//scale] float32 [0,1]
+        """
+        p = self.params
+        C, H, W = hr_tensor.shape
 
-        return clip_image(img)
+        # ── Step 1: Motion blur (Eq.2.31) ────────────────────────
+        # Simulasi getaran gimbal UAV → Gaussian blur dengan sigma acak
+        sigma   = random.uniform(*p['blur_sigma_range'])
+        hr_pil  = TF.to_pil_image(hr_tensor.clamp(0, 1))
+        hr_pil  = hr_pil.filter(ImageFilter.GaussianBlur(radius=sigma))
+        hr_t    = TF.to_tensor(hr_pil)
+
+        # ── Step 2: Exposure flicker (Eq.2.32) ───────────────────
+        # Simulasi fluktuasi pencahayaan selama penerbangan
+        alpha   = random.uniform(*p['exposure_range'])
+        hr_t    = (hr_t * alpha).clamp(0, 1)
+
+        # ── Step 3: Downsampling (Eq.2.33) ───────────────────────
+        # Turunkan resolusi sesuai scale_factor
+        lH, lW  = H // self.scale_factor, W // self.scale_factor
+        lr_t    = F.interpolate(
+            hr_t.unsqueeze(0), size=(lH, lW),
+            mode='bicubic', antialias=True
+        ).squeeze(0).clamp(0, 1)
+
+        # ── Step 4: UAV Noise (Eq.2.34) ──────────────────────────
+        # Gaussian + Poisson — simulasi noise sensor dan angin
+        std     = random.uniform(*p['gaussian_std_range'])
+        noise_g = torch.randn_like(lr_t) * std
+        noise_p = (torch.poisson(lr_t * 255.0) / 255.0 - lr_t) * p['poisson_scale']
+        lr_t    = (lr_t + noise_g + noise_p).clamp(0, 1)
+
+        # ── Step 5: Rotasi kamera kecil (Eq.2.35) ────────────────
+        # Simulasi perubahan sudut gimbal
+        angle   = random.uniform(*p['rotation_range'])
+        lr_pil  = TF.to_pil_image(lr_t)
+        lr_pil  = lr_pil.rotate(angle, expand=False)
+        lr_t    = TF.to_tensor(lr_pil)
+
+        # ── Step 6: JPEG compression (Eq.2.36) ───────────────────
+        # Simulasi artefak penyimpanan dan transmisi
+        quality = random.randint(*p['jpeg_quality_range'])
+        buf     = io.BytesIO()
+        TF.to_pil_image(lr_t.clamp(0, 1)).save(buf, format='JPEG', quality=quality)
+        buf.seek(0)
+        lr_t    = TF.to_tensor(Image.open(buf).copy())
+
+        return lr_t.clamp(0, 1)
+
+    def apply_batch(self, hr_batch: torch.Tensor) -> torch.Tensor:
+        """Terapkan pipeline ke batch [B, C, H, W]."""
+        return torch.stack(
+            [self.__call__(hr_batch[i]) for i in range(hr_batch.shape[0])],
+            dim=0
+        )
+
+    def describe(self) -> str:
+        """Deskripsi parameter aktif untuk logging."""
+        p = self.params
+        lines = [
+            f"  Level          : {self.level}",
+            f"  Scale factor   : {self.scale_factor}x",
+            f"  Blur σ         : {p['blur_sigma_range']}",
+            f"  Exposure α     : {p['exposure_range']}",
+            f"  Gaussian σ     : {p['gaussian_std_range']}",
+            f"  Poisson scale  : {p['poisson_scale']}",
+            f"  Rotation       : {p['rotation_range']} deg",
+            f"  JPEG quality   : {p['jpeg_quality_range']}",
+        ]
+        return "\n".join(lines)
 
 
-# ---------------------------------------------------------------------------
-# Test
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────
+# Self-test
+# ─────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
-    print("Testing UAV-Specific Degradation Pipeline...")
+    import math
+
+    print("=" * 55)
+    print("UAVSpecificDegradationPipeline — self-test semua level")
+    print("=" * 55)
 
     hr = torch.rand(3, 256, 256)
 
-    # Test individual komponen
-    print("Testing components:")
+    for level in UAVSpecificDegradationPipeline.LEVELS:
+        pipe = UAVSpecificDegradationPipeline(scale_factor=4, level=level)
+        lr   = pipe(hr)
 
-    blurred = apply_uav_motion_blur(hr)
-    print(f"  Motion blur: {hr.shape} -> {blurred.shape}, "
-          f"diff={abs(blurred - hr).mean():.4f} ✓")
+        assert lr.shape == (3, 64, 64), f"Shape salah: {lr.shape}"
+        assert lr.min() >= 0.0 and lr.max() <= 1.0, "Nilai di luar [0,1]"
 
-    exposed = apply_exposure_flicker(hr, alpha_range=(0.8, 1.2))
-    print(f"  Exposure flicker: {hr.shape} -> {exposed.shape} ✓")
+        # Hitung PSNR HR (bicubic upscale LR) vs HR asli sebagai indikator
+        lr_up  = F.interpolate(lr.unsqueeze(0), size=(256, 256),
+                               mode='bicubic', antialias=True).squeeze(0).clamp(0, 1)
+        mse    = ((hr - lr_up) ** 2).mean().item()
+        psnr   = 10 * math.log10(1.0 / (mse + 1e-8))
 
-    noisy = add_uav_noise(hr)
-    print(f"  UAV noise: {hr.shape} -> {noisy.shape}, "
-          f"diff={abs(noisy - hr).mean():.4f} ✓")
+        print(f"\n[{level.upper():8s}] LR shape: {list(lr.shape)} | "
+              f"Bicubic PSNR: {psnr:.2f} dB")
+        print(pipe.describe())
 
-    hazy = apply_haze(hr)
-    print(f"  Haze: {hr.shape} -> {hazy.shape} ✓")
-
-    rotated = apply_small_rotation(hr, theta_max=3.0)
-    print(f"  Rotation: {hr.shape} -> {rotated.shape} ✓")
-
-    # Test full pipeline
-    pipeline = UAVSpecificDegradationPipeline(scale_factor=4)
-    lr = pipeline(hr)
-    print(f"\nFull UAV pipeline: {hr.shape} -> {lr.shape}")
-    print(f"LR range: [{lr.min():.4f}, {lr.max():.4f}]")
-    assert lr.shape == (3, 64, 64), f"Expected (3,64,64), got {lr.shape}"
-
-    # Run multiple times untuk test variasi
-    print("Testing pipeline variability (5 runs):")
-    lrs = [pipeline(hr) for _ in range(5)]
-    diffs = [abs(lrs[i] - lrs[i+1]).mean().item() for i in range(4)]
-    print(f"  Mean diff between runs: {sum(diffs)/len(diffs):.4f} (harus > 0)")
-    assert sum(diffs) > 0, "Pipeline harus menghasilkan variasi!"
-
-    print("\nUAV Degradation Pipeline test PASSED!")
+    print("\nSemua level PASSED ✓")
+    print()
+    print("Panduan pemilihan level untuk tesis:")
+    print("  mild     → mulai dari sini, pastikan model bisa konvergen dulu")
+    print("  moderate → level rekomendasi untuk training utama tesis")
+    print("  strong   → jika moderate sudah bagus, coba ini untuk robustness")
+    print("  severe   → tidak direkomendasikan (terlalu jauh dari kondisi nyata)")

@@ -281,6 +281,9 @@ class EpochTrainer:
         val_epoch_freq: int = 1,
         save_epoch_freq: int = 1,
         vis_epoch_freq: int = 5,
+        # Level intensitas degradasi UAV
+        # 'mild' | 'moderate' | 'strong' | 'severe'
+        degradation_level: str = 'moderate',
         pretrained_path: Optional[str] = None,
         use_amp: bool = True,
         num_workers: int = 2,
@@ -299,6 +302,7 @@ class EpochTrainer:
         self.pretrain_epochs   = pretrain_epochs       # [v4-FIX-1]
         self.adv_warmup_epochs = adv_warmup_epochs     # [v4-FIX-2]
         self.lr_warmup_epochs  = lr_warmup_epochs      # [v4-FIX-3]
+        self.degradation_level = degradation_level     # level degradasi UAV
         self.lambda_adv_full   = lambda_adv            # [v4-FIX-2] simpan nilai penuh
         self.log_iter_freq     = log_iter_freq
         self.metric_epoch_freq = metric_epoch_freq
@@ -325,6 +329,7 @@ class EpochTrainer:
         self.logger.info(f"[v4-FIX-1] pretrain_epochs   = {pretrain_epochs}")
         self.logger.info(f"[v4-FIX-2] adv_warmup_epochs = {adv_warmup_epochs}")
         self.logger.info(f"[v4-FIX-3] lr_warmup_epochs  = {lr_warmup_epochs}")
+        self.logger.info(f"Degradation level  = {degradation_level}")
         self.logger.info(f"[PATCH 1]  lambda_edge={lambda_edge}, lambda_vsd={lambda_vsd}")
         self.logger.info(f"[PATCH 2]  use_hr2={use_hr2}")
         self.logger.info(f"[PATCH 4]  lr_schedule={lr_schedule}")
@@ -348,7 +353,8 @@ class EpochTrainer:
             hr_train_dir=hr_train_dir, hr_val_dir=hr_val_dir,
             batch_size=batch_size, gt_patch_size=gt_patch_size,
             eval_patch_size=eval_patch_size, scale_factor=scale_factor,
-            num_workers=num_workers)
+            num_workers=num_workers,
+            degradation_level=degradation_level)
 
         self.history     = TrainingHistory()
         self.start_epoch = 1
@@ -448,11 +454,15 @@ class EpochTrainer:
     def _build_dataloaders(self, dataset_root=None, train_list=None,
                            val_list=None, hr_train_dir=None, hr_val_dir=None,
                            batch_size=4, gt_patch_size=256, eval_patch_size=512,
-                           scale_factor=4, num_workers=2):
+                           scale_factor=4, num_workers=2,
+                           degradation_level='moderate'):
         if self.flags['use_uav_deg']:
             from data.uav_degradation import UAVSpecificDegradationPipeline
-            pipeline = UAVSpecificDegradationPipeline(scale_factor=scale_factor)
-            self.logger.info("Degradation: UAV-Specific")
+            pipeline = UAVSpecificDegradationPipeline(
+                scale_factor=scale_factor,
+                level=degradation_level)
+            self.logger.info(f"Degradation: UAV-Specific [{degradation_level}]")
+            self.logger.info(pipeline.describe())
         else:
             from data.degradation import IRE_DegradationPipeline
             pipeline = IRE_DegradationPipeline(scale_factor=scale_factor)
