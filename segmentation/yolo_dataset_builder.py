@@ -38,7 +38,7 @@ from typing import List, Tuple, Optional
 def mask_to_yolo_polygons(
     mask_path: str,
     min_area_px: int = 100,
-    epsilon_factor: float = 0.005,
+    epsilon_factor: float = 0.002,   # lebih kecil = polygon lebih halus, detail tepi gulma terjaga
 ) -> List[str]:
     """
     Konversi mask binary PNG ke daftar string YOLO-seg.
@@ -144,6 +144,9 @@ def build_yolo_dataset(
     stats = {}
 
     for split, list_path in splits.items():
+        # Filter noise hanya pada TRAIN. Val/test: ambil semua gulma agar
+        # evaluasi mIoU adil (jangan buang gulma kecil dari ground-truth).
+        split_min_area = min_area_px if split == 'train' else 1
         img_out_dir   = os.path.join(output_dir, 'images', split)
         label_out_dir = os.path.join(output_dir, 'labels', split)
         os.makedirs(img_out_dir,   exist_ok=True)
@@ -180,7 +183,7 @@ def build_yolo_dataset(
             # ── Konversi mask → YOLO label ───────────────
             label_dest = os.path.join(label_out_dir, stem + '.txt')
             if os.path.isfile(mask_path):
-                yolo_lines = mask_to_yolo_polygons(mask_path, min_area_px)
+                yolo_lines = mask_to_yolo_polygons(mask_path, split_min_area)
                 with open(label_dest, 'w') as f:
                     f.write('\n'.join(yolo_lines))
                 if yolo_lines:

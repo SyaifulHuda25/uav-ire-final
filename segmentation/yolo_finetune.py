@@ -1,130 +1,122 @@
 """
-YOLOv8n-seg Fine-Tuning (Sangat Minimal)
-Model  : YOLOv8n-seg (nano) — paling ringan dan cepat
-Strategi: backbone FROZEN, hanya train segmentation head
-Durasi : 1–3 epoch saja — cukup agar model mengenal kelas "weed"
+YOLOv8n-seg Fine-Tuning — WeedyRice Weed Segmentation
 
-Justifikasi untuk tesis:
-- COCO pretrained tidak memiliki kelas "weed/gulma"
-- Training 1–3 epoch dengan backbone frozen = dampak minimal
-  pada bobot jaringan, sehingga tidak mengaburkan perbandingan
-  dampak SR antar skenario SEG1–SEG5
-- Model yang sama (satu best.pt) dipakai untuk SEMUA skenario
-  → fair comparison
+Dua mode freeze (lihat arg `freeze_mode`):
+  'frozen'  : backbone (layer 0-9) FROZEN — untuk fair comparison antar
+              skenario SEG1-SEG5. LR rendah, epoch sedang.
+  'full'    : seluruh jaringan trainable — untuk mIoU maksimal. Pakai
+              warmup + cosine decay + early stopping.
 
-Referensi: Yang et al. (2025) — YOLOv8-seg sebagai model evaluatif
+Perbaikan vs versi lama:
+  - LR schedule benar: lr0 disesuaikan per-mode, cosine decay (cos_lr=True),
+    warmup eksplisit. Versi lama lr0=1e-3 + 100 epoch + lrf=0.1 membuat
+    head berosilasi sehingga mIoU stagnan.
+  - Early stopping nyata (patience), bukan patience=epochs.
+  - Optimizer AdamW (lebih stabil untuk head pada data kecil).
+  - close_mosaic 10 epoch terakhir agar tepi mask di-fine-tune tanpa mosaic.
 """
 
 import os
 import shutil
 from pathlib import Path
-from typing import Optional
 
 
 def finetune_yolov8n_seg(
     data_yaml: str,
     output_dir: str,
-    epochs: int = 3,             # 1–3 epoch cukup untuk mengenal kelas weed
+    epochs: int = 80,
     img_size: int = 640,
     batch_size: int = 8,
-    lr0: float = 1e-3,           # LR lebih tinggi karena epoch sedikit
     device: str = '',
+    freeze_mode: str = 'frozen',     # 'frozen' | 'full'
+    lr0: float = None,               # None = default per-mode
+    patience: int = 20,
+    run_name: str = None,
 ) -> str:
-    """
-    Fine-tune YOLOv8n-seg pada WeedyRice dengan backbone sepenuhnya frozen.
-    Hanya segmentation head yang dilatih.
-
-    Args:
-        data_yaml   : Path ke data.yaml dataset YOLO
-        output_dir  : Folder simpan model
-        epochs      : Jumlah epoch (1–3, default 3)
-        img_size    : Ukuran input YOLO (640)
-        batch_size  : Batch size (8 di T4)
-        lr0         : Learning rate
-        device      : '' = auto-detect GPU/CPU
-
-    Returns:
-        Path ke best.pt model
-    """
     try:
         from ultralytics import YOLO
     except ImportError:
-        raise ImportError(
-            "ultralytics belum terinstall.\n"
-            "Jalankan: pip install ultralytics"
-        )
+        raise ImportError("ultralytics belum terinstall. Jalankan: pip install ultralytics")
+
+    if freeze_mode not in ('frozen', 'full'):
+        raise ValueError("freeze_mode harus 'frozen' atau 'full'")
 
     os.makedirs(output_dir, exist_ok=True)
 
-    # Load YOLOv8n-seg pretrained COCO
+    if freeze_mode == 'frozen':
+        freeze_layers = 10           # backbone YOLOv8n = layer 0-9
+        default_lr0   = 1e-3
+        warmup        = 3.0
+    else:  # 'full'
+        freeze_layers = 0
+        default_lr0   = 1e-4         # backbone ikut dilatih -> LR kecil
+        warmup        = 5.0
+
+    lr0 = lr0 if lr0 is not None else default_lr0
+    run_name = run_name or f'yolov8n_weed_{freeze_mode}'
+
     print("Loading yolov8n-seg.pt (pretrained COCO)...")
     model = YOLO('yolov8n-seg.pt')
 
-    # Freeze: layer 0–9 = backbone YOLOv8n
-    # Neck (layer 10–18) + Head (layer 19–22) tetap trainable
-    # Dengan 3 epoch, neck+head belajar mengenal pola gulma UAV
-    FREEZE_N_LAYERS = 10
+    print(f"\nFine-tuning YOLOv8n-seg - mode='{freeze_mode}'")
+    print(f"  Freeze layers : {freeze_layers} (0=full trainable)")
+    print(f"  Epochs        : {epochs} (early stop patience={patience})")
+    print(f"  lr0           : {lr0:.1e} | cosine decay | warmup={warmup}ep")
+    print(f"  Batch / imgsz : {batch_size} / {img_size}")
+    print(f"  Data          : {data_yaml}\n")
 
-    print(f"\nFine-tuning YOLOv8n-seg — WeedyRice Weed Segmentation")
-    print(f"  Backbone (0-9)  : FROZEN sepenuhnya")
-    print(f"  Neck + Head     : Trainable")
-    print(f"  Epochs          : {epochs}")
-    print(f"  Batch size      : {batch_size}")
-    print(f"  Learning rate   : {lr0}")
-    print(f"  Data            : {data_yaml}")
-    print()
-
-    results = model.train(
+    model.train(
         data         = data_yaml,
         epochs       = epochs,
         imgsz        = img_size,
         batch        = batch_size,
-        lr0          = lr0,
-        lrf          = 0.1,           # LR final = lr0 * lrf
-        freeze       = FREEZE_N_LAYERS,
-        patience     = epochs,        # jangan early stop — epoch sudah sangat sedikit
-        project      = output_dir,
-        name         = 'yolov8n_weed',
-        exist_ok     = True,
+        freeze       = freeze_layers,
         device       = device,
         task         = 'segment',
-        # Augmentasi minimal — kita evaluator, bukan model utama
-        hsv_h        = 0.01,
-        hsv_s        = 0.5,
-        hsv_v        = 0.3,
-        degrees      = 3.0,
-        translate    = 0.05,
-        scale        = 0.2,
+
+        # Optimizer & LR schedule (inti perbaikan)
+        optimizer    = 'AdamW',
+        lr0          = lr0,
+        lrf          = 0.01,
+        cos_lr       = True,
+        warmup_epochs= warmup,
+        weight_decay = 5e-4,
+        momentum     = 0.937,
+
+        patience     = patience,
+
+        # Augmentasi sedang
+        hsv_h        = 0.015,
+        hsv_s        = 0.6,
+        hsv_v        = 0.4,
+        degrees      = 5.0,
+        translate    = 0.1,
+        scale        = 0.3,
         fliplr       = 0.5,
-        flipud       = 0.1,
-        mosaic       = 0.3,
-        close_mosaic = 1,
-        # Checkpoint
+        flipud       = 0.2,
+        mosaic       = 0.5,
+        close_mosaic = 10,
+
+        project      = output_dir,
+        name         = run_name,
+        exist_ok     = True,
         save         = True,
-        save_period  = 1,
         val          = True,
         plots        = True,
         verbose      = True,
-        # Tidak pakai DDP / kompleksitas tambahan
         workers      = 2,
     )
 
-    # Cari best.pt
-    run_dir = Path(str(results.save_dir)) \
-              if hasattr(results, 'save_dir') \
-              else Path(output_dir) / 'yolov8n_weed'
-
-    best_pt  = run_dir / 'weights' / 'best.pt'
-    last_pt  = run_dir / 'weights' / 'last.pt'
-
-    # Fallback ke last.pt jika best.pt tidak ada
-    chosen = best_pt if best_pt.is_file() else last_pt
+    run_dir = Path(output_dir) / run_name
+    best_pt = run_dir / 'weights' / 'best.pt'
+    last_pt = run_dir / 'weights' / 'last.pt'
+    chosen  = best_pt if best_pt.is_file() else last_pt
 
     final_pt = os.path.join(output_dir, 'yolov8n_weed_best.pt')
     if chosen.is_file():
         shutil.copy2(str(chosen), final_pt)
-        print(f"\nModel saved: {final_pt}")
+        print(f"\nModel saved: {final_pt}  (from {chosen.name})")
         return final_pt
-    else:
-        print(f"\n[WARN] Checkpoint tidak ditemukan di {run_dir}")
-        return str(chosen)
+
+    print(f"\n[WARN] Checkpoint tidak ditemukan di {run_dir}")
+    return str(chosen)
