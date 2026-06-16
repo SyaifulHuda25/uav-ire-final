@@ -267,7 +267,7 @@ class EpochTrainer:
         total_epochs: int = 50,
         batch_size: int = 4,
         gt_patch_size: int = 256,
-        eval_patch_size: int = 512,
+        eval_patch_size: int = 256,
         scale_factor: int = 2,
         num_rrdb: int = 23,
         num_features: int = 64,
