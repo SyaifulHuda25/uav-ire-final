@@ -147,7 +147,7 @@ class IRE_Generator(nn.Module):
         num_features: int = 64,
         num_rrdb: int = 23,
         growth_rate: int = 32,
-        scale_factor: int = 4,
+        scale_factor: int = 2,
     ):
         super().__init__()
         self.scale_factor = scale_factor

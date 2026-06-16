@@ -32,7 +32,7 @@ def save_comparison_grid(
     sr: torch.Tensor,
     hr: torch.Tensor,
     save_path: str,
-    scale_factor: int = 4,
+    scale_factor: int = 2,
     nrow: int = 4,
     add_labels: bool = True,
 ):

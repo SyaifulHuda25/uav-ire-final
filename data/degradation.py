@@ -322,7 +322,7 @@ class IRE_DegradationPipeline:
 
     def __init__(
         self,
-        scale_factor: int = 4,
+        scale_factor: int = 2,
         # Blur params
         blur_kernel_range: Tuple[int, int] = (7, 21),
         blur_sigma_range: Tuple[float, float] = (0.5, 3.0),

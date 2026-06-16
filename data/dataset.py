@@ -76,7 +76,7 @@ class IRE_TrainDataset(Dataset):
         self,
         hr_dir: str,
         gt_patch_size: int = 256,
-        scale_factor: int = 4,
+        scale_factor: int = 2,
         degradation_pipeline: Optional[IRE_DegradationPipeline] = None,
         use_aug: bool = True,
     ):
@@ -167,7 +167,7 @@ class IRE_ValDataset(Dataset):
         self,
         hr_dir: str,
         lr_dir: Optional[str] = None,
-        scale_factor: int = 4,
+        scale_factor: int = 2,
         max_size: Optional[int] = None,
     ):
         super().__init__()
@@ -236,7 +236,7 @@ def create_train_dataloader(
     hr_dir: str,
     batch_size: int = 16,
     gt_patch_size: int = 256,
-    scale_factor: int = 4,
+    scale_factor: int = 2,
     num_workers: int = 4,
     pin_memory: bool = True,
 ) -> DataLoader:
@@ -260,7 +260,7 @@ def create_train_dataloader(
 def create_val_dataloader(
     hr_dir: str,
     lr_dir: Optional[str] = None,
-    scale_factor: int = 4,
+    scale_factor: int = 2,
     batch_size: int = 1,
     num_workers: int = 2,
     max_size: Optional[int] = None,

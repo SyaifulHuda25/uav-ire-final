@@ -361,7 +361,7 @@ def verify_uav_ire_generator():
     from models.ega import EGA
 
     gen = UAVIRE_Generator(
-        num_rrdb=4, scale_factor=4, num_features=32
+        num_rrdb=4, scale_factor=2, num_features=32
     )
     x = torch.randn(1, 3, 32, 32)
 

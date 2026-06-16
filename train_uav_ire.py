@@ -41,7 +41,7 @@ class UAVIREConfig:
 
     # Model
     num_rrdb: int = 23
-    scale_factor: int = 4
+    scale_factor: int = 2
     num_features: int = 64
 
     # Ablation flags (Tabel 3.1)

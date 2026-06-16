@@ -115,7 +115,7 @@ class UAVIRE_Generator(nn.Module):
         num_features: int = 64,
         num_rrdb: int = 23,
         growth_rate: int = 32,
-        scale_factor: int = 4,
+        scale_factor: int = 2,
         # NRDB config
         num_nrdb_layers: int = 3,
         # MBCM config
@@ -262,7 +262,7 @@ class UAVIRE_Model(nn.Module):
     def __init__(
         self,
         num_rrdb: int = 23,
-        scale_factor: int = 4,
+        scale_factor: int = 2,
         num_features: int = 64,
         # VSD lambdas
         vsd_lambda_g: float = 1.0,
@@ -304,7 +304,7 @@ if __name__ == '__main__':
     # Test dengan num_rrdb kecil untuk kecepatan
     gen = UAVIRE_Generator(
         num_rrdb=4,
-        scale_factor=4,
+        scale_factor=2,
         num_features=32,
     ).to(device)
 

@@ -211,7 +211,7 @@ class HR2CleanValDataset(Dataset):
         self,
         dataset_root: str,
         list_file: str,
-        eval_patch_size: int = 512,
+        eval_patch_size: int = 256,
         scale_factor: int = 2,
         use_mask: bool = True,
         max_samples: Optional[int] = None,
