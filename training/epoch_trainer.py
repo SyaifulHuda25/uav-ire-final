@@ -268,7 +268,7 @@ class EpochTrainer:
         batch_size: int = 4,
         gt_patch_size: int = 256,
         eval_patch_size: int = 512,
-        scale_factor: int = 4,
+        scale_factor: int = 2,
         num_rrdb: int = 23,
         num_features: int = 64,
         lr_g: float = 1e-4,
@@ -468,7 +468,7 @@ class EpochTrainer:
     def _build_dataloaders(self, dataset_root=None, train_list=None,
                            val_list=None, hr_train_dir=None, hr_val_dir=None,
                            batch_size=4, gt_patch_size=256, eval_patch_size=512,
-                           scale_factor=4, num_workers=2,
+                           scale_factor=scale_factor, num_workers=2,
                            degradation_level='moderate'):
 
         # =========================================================

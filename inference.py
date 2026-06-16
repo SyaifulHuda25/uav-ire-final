@@ -34,7 +34,7 @@ from utils.metrics import calculate_psnr, calculate_ssim, calculate_niqe
 # ──────────────────────────────────────────────────────────────
 
 def load_generator(model_path: str, experiment: str = 'full',
-                   num_rrdb: int = 23, scale_factor: int = 4,
+                   num_rrdb: int = 23, scale_factor: int = 2,
                    num_features: int = 64,
                    device: Optional[torch.device] = None):
     device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -285,7 +285,7 @@ def run_inference(
     output_dir: str,
     experiment: str = 'full',
     num_rrdb: int = 23,
-    scale_factor: int = 4,
+    scale_factor: int = 2,
     num_features: int = 64,
     tile_size: Optional[int] = None,
     file_list: Optional[str] = None,    # path ke test_list.txt (filter gambar)
@@ -457,7 +457,7 @@ def parse_args():
     p.add_argument('--experiment',  default='full',
                    choices=['full','baseline','no_nrdb','no_mbcm','no_ega','no_vsd'])
     p.add_argument('--num_rrdb',    type=int, default=23)
-    p.add_argument('--scale',       type=int, default=4)
+    p.add_argument('--scale',       type=int, default=2)
     p.add_argument('--tile_size',   type=int, default=None,
                    help='Aktifkan tile inference (untuk gambar besar/VRAM kecil)')
     p.add_argument('--niqe',        action='store_true', help='Hitung NIQE (lebih lambat)')

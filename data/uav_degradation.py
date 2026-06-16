@@ -14,7 +14,7 @@ Cara pakai di notebook SEL 1:
   DEGRADATION_LEVEL = 'mild'      # ganti sesuai skenario
 
 Cara pakai di epoch_trainer.py:
-  pipeline = UAVSpecificDegradationPipeline(scale_factor=4, level='mild')
+  pipeline = UAVSpecificDegradationPipeline(scale_factor=2, level="mild")
 """
 
 import random
@@ -76,7 +76,7 @@ class UAVSpecificDegradationPipeline:
     Mengikuti urutan Eq.(2.31)–(2.36) dari proposal.
 
     Args:
-        scale_factor: Faktor downsampling (default 4 untuk SR×4)
+        scale_factor: Faktor downsampling (2 untuk SR×2, 4 untuk SR×4)
         level: Level intensitas degradasi ('mild'|'moderate'|'strong'|'severe')
 
     Input : torch.Tensor [C, H, W] float32 range [0,1]  (HR asli)
@@ -85,7 +85,7 @@ class UAVSpecificDegradationPipeline:
 
     LEVELS = ('mild', 'moderate', 'strong', 'severe')
 
-    def __init__(self, scale_factor: int = 4, level: str = 'moderate'):
+    def __init__(self, scale_factor: int = 2, level: str = 'moderate'):
         assert level in self.LEVELS, \
             f"level harus salah satu dari {self.LEVELS}, bukan '{level}'"
         self.scale_factor = scale_factor
@@ -195,7 +195,7 @@ if __name__ == '__main__':
     hr = torch.rand(3, 256, 256)
 
     for level in UAVSpecificDegradationPipeline.LEVELS:
-        pipe = UAVSpecificDegradationPipeline(scale_factor=4, level=level)
+        pipe = UAVSpecificDegradationPipeline(scale_factor=2, level=level)
         lr   = pipe(hr)
 
         assert lr.shape == (3, 64, 64), f"Shape salah: {lr.shape}"

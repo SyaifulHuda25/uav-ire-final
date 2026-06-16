@@ -113,7 +113,7 @@ class WeedyRiceTrainDataset(Dataset):
         dataset_root: str,
         list_file: str,
         gt_patch_size: int = 256,
-        scale_factor: int = 4,
+        scale_factor: int = 2,
         degradation_pipeline=None,
         use_aug: bool = True,
         use_mask: bool = True,
@@ -230,7 +230,7 @@ class WeedyRiceTrainDataset(Dataset):
             hr, mask = self._augment(hr, mask)
 
         # ── Bangkitkan LR via degradation ───────────────────
-        lr = self.pipeline(hr)            # [3, 64, 64] untuk scale=4
+        lr = self.pipeline(hr)            # [3, patch//scale, patch//scale]
 
         return lr, hr, mask
 
@@ -269,8 +269,8 @@ class WeedyRiceValDataset(Dataset):
         self,
         dataset_root: str,
         list_file: str,
-        eval_patch_size: int = 512,
-        scale_factor: int = 4,
+        eval_patch_size: int = 256,
+        scale_factor: int = 2,
         use_mask: bool = True,
         max_samples: Optional[int] = None,
         degradation_pipeline=None,   # [FIX] pipeline degradasi konsisten dengan training
@@ -409,7 +409,7 @@ def make_train_loader(
     dataset_root: str = KAGGLE_ROOT,
     list_file: Optional[str] = None,
     gt_patch_size: int = 256,
-    scale_factor: int = 4,
+    scale_factor: int = 2,
     batch_size: int = 4,
     num_workers: int = 2,
     use_mask: bool = True,
@@ -449,8 +449,8 @@ def make_train_loader(
 def make_val_loader(
     dataset_root: str = KAGGLE_ROOT,
     list_file: Optional[str] = None,
-    eval_patch_size: int = 512,
-    scale_factor: int = 4,
+    eval_patch_size: int = 256,
+    scale_factor: int = 2,
     batch_size: int = 1,
     num_workers: int = 0,
     use_mask: bool = True,
