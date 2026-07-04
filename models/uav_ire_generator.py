@@ -49,7 +49,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from models.network import RRDB, ChannelAttention, PatchGAN_Discriminator
-from models.nrdb import NRDB_Block
+from models.nrdb import NRDB
 from models.mbcm import MBCM
 from models.ega import EGA
 
@@ -139,7 +139,7 @@ class UAVIRE_Generator(nn.Module):
         # ============================================================
 
         # Branch 1: Noise suppression path
-        self.nrdb = NRDB_Block(num_features, num_nrdb_layers)
+        self.nrdb = NRDB(num_features, num_nrdb_layers)
         # RRDB blocks untuk jalur noise-cleaned features
         n_rrdb_branch = max(num_rrdb // 2, 3)   # Bagi RRDB antara dua jalur
         self.rrdb_nrdb_path = nn.Sequential(
