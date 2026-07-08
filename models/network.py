@@ -175,13 +175,30 @@ class IRE_Generator(nn.Module):
                 nn.PixelShuffle(2),
                 nn.LeakyReLU(0.2, inplace=True),
             ]
+            self._fractional_scale = False
         elif scale_factor == 2:
             upsample_layers += [
                 nn.Conv2d(num_features, num_features * 4, 3, padding=1, bias=True),
                 nn.PixelShuffle(2),
                 nn.LeakyReLU(0.2, inplace=True),
             ]
+            self._fractional_scale = False
+        else:
+            # CATATAN METODOLOGIS: cabang ini KHUSUS eksperimen kalibrasi Lanczos
+            # scale pecahan (3/4, 4/5, 5/6, 9/10 dst -- kampanye K7), BUKAN bagian
+            # arsitektur SR1-SR6 utama yang tetap pakai PixelShuffle scale=2.
+            # PixelShuffle tidak bisa menangani scale non-integer (4/3, 5/4, dst),
+            # jadi dipakai interpolation-based upsample (bicubic) + conv refine
+            # sebagai gantinya. Ini deviasi dari sub-pixel conv asli Real-ESRGAN --
+            # wajib dicatat sebagai batasan pada eksperimen kalibrasi kalau ditanya.
+            upsample_layers += [
+                nn.Upsample(scale_factor=scale_factor, mode='bicubic', align_corners=False),
+                nn.Conv2d(num_features, num_features, 3, padding=1, bias=True),
+                nn.LeakyReLU(0.2, inplace=True),
+            ]
+            self._fractional_scale = True
         self.upsample = nn.Sequential(*upsample_layers)
+        self._target_size = None  # di-set eksternal sebelum forward() kalau fractional
 
         # Conv output
         self.conv_hr = nn.Conv2d(num_features, num_features, 3, padding=1, bias=True)
@@ -203,6 +220,12 @@ class IRE_Generator(nn.Module):
         body_feat = self.conv_body(self.rrdb_blocks(feat))
         feat = feat + body_feat  # Residual connection global
         feat = self.upsample(feat)
+        if self._fractional_scale and self._target_size is not None:
+            # Snap ke ukuran HR pasangan yang eksak (menghindari off-by-1 px
+            # akibat pembulatan ganda saat downsample Lanczos lalu upsample bicubic)
+            feat = torch.nn.functional.interpolate(
+                feat, size=self._target_size, mode='bicubic', align_corners=False
+            )
         out = self.conv_last(self.lrelu(self.conv_hr(feat)))
         return out
 
