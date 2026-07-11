@@ -82,7 +82,7 @@ class UAVIRE_Generator(nn.Module):
         num_features: int = 64,
         num_rrdb: int = 23,
         growth_rate: int = 32,
-        scale_factor: int = 2,
+        scale_factor=2,      # int (2 atau 4) ATAU float (0,1)-eksklusif utk rasio pecahan (K7)
         num_nrdb_layers: int = 3,
         num_directions: int = 4,
         num_blur_layers: int = 3,
@@ -157,13 +157,29 @@ class UAVIRE_Generator(nn.Module):
                 nn.PixelShuffle(2),
                 nn.LeakyReLU(0.2, inplace=True),
             ]
+            self._fractional_scale = False
         elif scale_factor == 2:
             upsample_layers += [
                 nn.Conv2d(num_features, num_features * 4, 3, padding=1, bias=True),
                 nn.PixelShuffle(2),
                 nn.LeakyReLU(0.2, inplace=True),
             ]
+            self._fractional_scale = False
+        else:
+            # [K7] Cabang KHUSUS skala pecahan (mis. 4/3 untuk rasio downsample 3/4,
+            # dipakai kampanye K7 dan studi ablasi UAV1-UAV5 skala 3/4). PixelShuffle
+            # tidak bisa menangani scale non-integer, jadi dipakai interpolation-based
+            # upsample (bicubic) + conv refine sebagai gantinya -- deviasi dari
+            # sub-pixel conv asli, konsisten dengan cabang setara di IRE_Generator
+            # (models/network.py). Wajib dicatat sebagai batasan metodologis.
+            upsample_layers += [
+                nn.Upsample(scale_factor=scale_factor, mode='bicubic', align_corners=False),
+                nn.Conv2d(num_features, num_features, 3, padding=1, bias=True),
+                nn.LeakyReLU(0.2, inplace=True),
+            ]
+            self._fractional_scale = True
         self.upsample = nn.Sequential(*upsample_layers)
+        self._target_size = None  # di-set eksternal sebelum forward() kalau fractional
 
         # ============================================================
         # Stage 5: Output Convolutions — selalu ada
@@ -217,6 +233,13 @@ class UAVIRE_Generator(nn.Module):
             feat = self.ega(feat)  # Edge-enhanced
 
         feat = self.upsample(feat)  # [B, F, H*scale, W*scale]
+
+        if self._fractional_scale and self._target_size is not None:
+            # Snap ke ukuran HR pasangan yang eksak (menghindari off-by-1 px
+            # akibat pembulatan ganda saat downsample Lanczos lalu upsample bicubic)
+            feat = F.interpolate(
+                feat, size=self._target_size, mode='bicubic', align_corners=False
+            )
 
         out = self.conv_last(self.lrelu(self.conv_hr(feat)))
         return out
