@@ -70,7 +70,25 @@ def load_generator(model_path: str, experiment: str = 'full',
 @torch.no_grad()
 def infer_tile(gen, lr: torch.Tensor, tile: int = 256,
                overlap: int = 32, device=None) -> torch.Tensor:
-    """Inferensi dengan tiling untuk gambar yang melebihi VRAM."""
+    """Inferensi dengan tiling untuk gambar yang melebihi VRAM.
+
+    [PATCH K7] Versi asli menghitung scale dengan `tile_sr.shape[-1] // tile_lr.shape[-1]`
+    (integer division). Ini SALAH untuk scale fractional (mis. 1.3333x dari kampanye K7):
+    683 // 512 = 1, bukan ~1.33 -- akibatnya buffer output disamakan ukurannya dengan LR
+    (tidak ada upscaling sama sekali). Fix di bawah ini:
+      1. scale dihitung sbg FLOAT (rata-rata rasio tinggi & lebar dari tile pertama)
+      2. ukuran buffer output = round(H*scale), round(W*scale) -- bukan H*scale_int
+      3. offset penempatan tiap tile = round(top*scale), bukan top*scale_int
+      4. tiap tile di-crop [:th,:tw] sebelum ditempel -- jaga2 kalau ukuran actual
+         tile_sr sedikit beda dari window target (kuantisasi bicubic non-integer scale)
+    Backward-compatible: untuk scale integer (2x/4x, dipakai SR1-SR6) hasilnya identik
+    dengan versi lama krn round(H*2.0) == H*2 selalu eksak.
+
+    CATATAN: utk generator fractional-scale (K7), pastikan `gen._target_size = None`
+    SEBELUM memanggil fungsi ini -- kalau di-set ke ukuran patch training (mis. 256x256),
+    setiap tile akan dipaksa snap ke ukuran itu alih-alih mengikuti ukuran tile aktual,
+    dan tiling akan rusak total.
+    """
     if device is None:
         device = next(gen.parameters()).device
     squeeze = lr.dim() == 3
@@ -79,11 +97,12 @@ def infer_tile(gen, lr: torch.Tensor, tile: int = 256,
     lr = lr.to(device)
 
     B, C, H, W = lr.shape
-    scale = None  # Akan ditentukan dari first tile
+    scale = None  # Akan ditentukan dari first tile (float, bukan int)
 
     stride = tile - overlap
     out_buf   = None
     count_buf = None
+    out_H = out_W = None
 
     for top in range(0, H, stride):
         for left in range(0, W, stride):
@@ -93,18 +112,25 @@ def infer_tile(gen, lr: torch.Tensor, tile: int = 256,
                 top = max(0, b - tile)
             if r - left < tile:
                 left = max(0, r - tile)
+            b = min(top + tile, H)
+            r = min(left + tile, W)
 
             tile_lr = lr[:, :, top:b, left:r]
             tile_sr = gen(tile_lr).clamp(0, 1)
 
             if scale is None:
-                scale = tile_sr.shape[-1] // tile_lr.shape[-1]
-                out_buf   = torch.zeros(B, C, H * scale, W * scale, device=device)
-                count_buf = torch.zeros(B, 1, H * scale, W * scale, device=device)
+                scale_h = tile_sr.shape[-2] / tile_lr.shape[-2]
+                scale_w = tile_sr.shape[-1] / tile_lr.shape[-1]
+                scale = (scale_h + scale_w) / 2
+                out_H, out_W = round(H * scale), round(W * scale)
+                out_buf   = torch.zeros(B, C, out_H, out_W, device=device)
+                count_buf = torch.zeros(B, 1, out_H, out_W, device=device)
 
-            ot, ob = top * scale, b * scale
-            ol, or_ = left * scale, r * scale
-            out_buf  [:, :, ot:ob, ol:or_] += tile_sr
+            ot, ol = round(top * scale), round(left * scale)
+            ob = min(ot + tile_sr.shape[-2], out_H)
+            or_ = min(ol + tile_sr.shape[-1], out_W)
+            th, tw = ob - ot, or_ - ol
+            out_buf  [:, :, ot:ob, ol:or_] += tile_sr[:, :, :th, :tw]
             count_buf[:, :, ot:ob, ol:or_] += 1
 
     out = (out_buf / count_buf.clamp(min=1)).clamp(0, 1)
